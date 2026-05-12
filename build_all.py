@@ -8,12 +8,13 @@ import glob
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CGECKO     = os.path.join(SCRIPT_DIR, "cgecko.py")
+ROOT_DIR   = os.path.dirname(SCRIPT_DIR)
 
 
 def find_sources() -> list[str]:
     sources = []
     for pattern in ("**/*.c", "**/*.asm", "**/*.ini"):
-        for path in glob.glob(os.path.join(SCRIPT_DIR, pattern), recursive=True):
+        for path in glob.glob(os.path.join(ROOT_DIR, pattern), recursive=True):
             if path.endswith(".rewritten.c"):
                 continue
             sources.append(path)
@@ -32,7 +33,7 @@ def main():
     failed: list[str] = []
 
     for src in sources:
-        rel = os.path.relpath(src, SCRIPT_DIR)
+        rel = os.path.relpath(src, ROOT_DIR)
         print(f"{'─' * 60}")
         print(f"Building: {rel}")
         print(f"{'─' * 60}")
