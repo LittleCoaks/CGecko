@@ -238,8 +238,8 @@ def assemble_instruction(asm_text: str, tmpdir: str) -> int:
 # OUTPUT PATH & CONFIG
 # ==============================================================================
 
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-TXT_PATH    = os.path.join(SCRIPT_DIR, "codes.txt")
+CONFIG_PATH = os.path.join(os.path.dirname(SCRIPT_DIR), "config.json")
+TXT_PATH    = os.path.join(os.path.dirname(SCRIPT_DIR), "codes.txt")
 
 def load_config() -> dict:
     if os.path.isfile(CONFIG_PATH):
