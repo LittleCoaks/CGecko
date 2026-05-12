@@ -1,11 +1,11 @@
-# Project Rio ASM/C
+# CGecko
 
-A repo for all of the gecko codes made by Project Rio. Designed to maximize convenience and efficiency for modders.
+A modding package designed to maximize convenience and efficiency for GameCube modders.
 
 This repo contains:
-- `.asm` and `.c` files of mods written for Project Rio.
 - Helper files `Common.s` and `Common.h` which contain macros to assist in writing mods efficiently and easily.
-- A build script `cgecko.py` which takes `.asm`/`.c` files and converts them to gecko codes.
+- A build script `cgecko.py` which takes `.asm`/`.c`/`.ini` files and converts them to gecko codes.
+- Integration with Dolphin to automatically import codes and launch the game
 
 ---
 
