@@ -118,29 +118,29 @@
 # STACK MANAGEMENT
 # ==============================================================================
 
-# backupall
+# backup
 # Save GPRs r3–r31 and LR to the stack, allocating a 0x100-byte frame.
 # Call at the start of an injection before touching any registers.
-# Must be paired with restoreall.
+# Must be paired with restore.
 #
-# Frame layout after backupall:
+# Frame layout after backup:
 #   new SP + 0x000  back-chain (old SP)
 #   new SP + 0x008  r3
 #   ...
 #   new SP + 0x080  r31
 #   old SP + 0x004  LR  (= new SP + 0x104)
-.macro backupall
+.macro backup
     mflr  r0
     stw   r0,  0x4(r1)
     stwu  r1, -0x100(r1)
     stmw  r3,  0x8(r1)
 .endm
 
-# restoreall
+# restore
 # Restore GPRs r3–r31 and LR from the stack, deallocating the 0x100-byte frame.
-# Must follow a matching backupall.
+# Must follow a matching backup.
 # Do NOT place a blr after this — execution falls through to the C2 terminator.
-.macro restoreall
+.macro restore
     lmw   r3,  0x8(r1)
     lwz   r0,  0x104(r1)
     addi  r1,  r1, 0x100
