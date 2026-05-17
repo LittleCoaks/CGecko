@@ -7,10 +7,12 @@ This repo contains:
 - A build script `cgecko.py` which takes `.asm`/`.c`/`.ini` files and converts them to gecko codes.
 - Integration with Dolphin to automatically import codes and launch the game
 
-Note: if you include CGecko as a submodule in your repo and CGecko has updates, make sure to pull the changes using:
+### Quick Tips:
+- if you include CGecko as a submodule in your repo and CGecko has updates, make sure to pull the changes using:
 ```bash
 git submodule update --remote CGecko
 ```
+- Refer to [ProjectRio-ASM](https://github.com/ProjectRio/ProjectRio-ASM) for examples of CGecko in use
 
 ---
 
