@@ -48,7 +48,7 @@ GCC_FLAGS = [
     "-fno-optimize-sibling-calls",
     "-O1",
     "-Wno-attributes",
-    f"-I{SCRIPT_DIR}",
+    f"-I{os.path.dirname(SCRIPT_DIR)}",
     "-c",
     "-ffixed-r30",   # r30 = saved frame base for macro stack access
     "-ffixed-r31",   # r31 = PIC register (data table base address)
@@ -57,7 +57,7 @@ GCC_FLAGS = [
 AS_FLAGS = [
     "-mregnames",
     "-mbig",
-    f"-I{SCRIPT_DIR}",
+    f"-I{os.path.dirname(SCRIPT_DIR)}",
 ]
 
 # ==============================================================================
