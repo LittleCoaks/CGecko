@@ -133,7 +133,10 @@ def _pat(key: str, value_re: str, flags=re.IGNORECASE | re.MULTILINE) -> re.Patt
 def _note_pat() -> re.Pattern:
     return re.compile(r"(?://|#)\s*(\*[^\n]*)", re.MULTILINE)
 
-ADDRESS_PATTERN     = _pat("Address",     r"(0x[0-9A-Fa-f]{8})")
+ADDRESS_PATTERN     = re.compile(
+    r"(?://|#)\s*(?:Address|Inject|Entry)\s*:\s*(0x[0-9A-Fa-f]{8})",
+    re.IGNORECASE | re.MULTILINE
+)
 AUTHOR_PATTERN      = _pat("Author",      r"(.+?)(?:\n|$)")
 INSTRUCTION_PATTERN = _pat("Instruction", r"(.+?)(?:\n|$)")
 STATE_PATTERN       = _pat("State",       r"(.+?)(?:\n|$)")
@@ -191,6 +194,27 @@ def parse_state(source: str) -> tuple[int, int] | None:
 def parse_notes(source: str) -> list[str]:
     return [m.group(1).strip() for m in NOTE_PATTERN.finditer(source)]
 
+# Matches the first non-static function signature in a source slice.
+# Does not include 'static' in the alternation, so static helpers are skipped.
+_FUNC_DEF_PATTERN = re.compile(
+    r"^[^\S\n]*"
+    r"(?:__attribute__\s*\(\s*\(\s*naked\s*\)\s*\)\s*)?"
+    r"(?:unsigned\s+)?(?:int|void|float|double|void\s*\*)"
+    r"\s+(\w+)\s*\([^)]*\)",
+    re.MULTILINE
+)
+
+def find_entry_func(source: str) -> str:
+    """Return the name of the first non-static function definition in source.
+
+    Skips declarations (ending in ';') and only returns the name when the
+    signature is immediately followed by '{', making it a definition.
+    """
+    for m in _FUNC_DEF_PATTERN.finditer(source):
+        if source[m.end():].lstrip().startswith("{"):
+            return m.group(1)
+    die("Could not find any function definition in source.")
+
 # ==============================================================================
 # INSTRUCTION ASSEMBLY
 # ==============================================================================
@@ -226,8 +250,156 @@ def assemble_instruction(asm_text: str, tmpdir: str) -> int:
     return struct.unpack(">I", data[:4])[0]
 
 # ==============================================================================
-# OUTPUT PATH & CONFIG
+# MULTI-SECTION
 # ==============================================================================
+
+def split_asm_sections(source: str) -> list[dict]:
+    """Split a multi-injection ASM file into per-section dicts.
+
+    Each section begins at an '// Address:' comment and runs to the next one.
+    Per-section // Instruction: is parsed from that section's slice only, so
+    each injection site can independently override the appended instruction.
+    """
+    matches = list(ADDRESS_PATTERN.finditer(source))
+
+    sections = []
+    for i, m in enumerate(matches):
+        start = m.start()
+        end   = matches[i + 1].start() if i + 1 < len(matches) else len(source)
+        text  = source[start:end]
+
+        addr = int(m.group(1), 16)
+        if addr % 4 != 0:
+            die(f"Address {hex(addr)} is not 4-byte aligned.")
+        if not (0x80000000 <= addr <= 0x81FFFFFF):
+            warn(f"Address {hex(addr)} is outside typical GameCube RAM.")
+
+        instr_m = INSTRUCTION_PATTERN.search(text)
+        sections.append({
+            "address":     addr,
+            "instruction": instr_m.group(1).strip() if instr_m else None,
+            "source":      text,
+        })
+
+    return sections
+
+
+def _build_asm_section(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
+    """Assemble one section of a multi-injection ASM file into gecko code lines."""
+    addr       = section["address"]
+    instr_text = section["instruction"]
+    src_text   = section["source"]
+
+    tag      = f"sec{idx}_{addr:08x}"
+    src_path = os.path.join(tmpdir, f"{tag}.s")
+    obj_path = os.path.join(tmpdir, f"{tag}.o")
+
+    with open(src_path, "w") as f:
+        f.write(src_text)
+
+    assemble_asm(src_path, obj_path, debug)
+
+    appended_instr: int | None = None
+    if instr_text:
+        appended_instr = assemble_instruction(instr_text, tmpdir)
+        print(f"[INFO]   Instruction hex : {appended_instr:#010x}")
+
+    payload = extract_section(obj_path, ".text")
+    if not payload:
+        die(f"Section {idx + 1} at {addr:#010x} produced no .text output.")
+
+    payload = replace_blr(payload, 0, debug)
+
+    if len(payload) == 4 and appended_instr is None:
+        instr_word = struct.unpack(">I", payload)[0]
+        lines = format_04(addr, instr_word)
+        print(f"[INFO]   {addr:#010x} → 04 write")
+    else:
+        payload = pad_and_terminate(payload, appended_instr, debug)
+        lines   = format_c2(addr, payload)
+        print(f"[INFO]   {addr:#010x} → C2  ({len(payload) // 4} words)")
+
+    return lines
+
+# ── C ──────────────────────────────────────────────────────────────────────────
+
+def split_c_sections(source: str) -> list[dict]:
+    """Split a multi-injection C file into per-section dicts.
+
+    Everything before the first Address/Inject/Entry comment is the preamble
+    (shared includes, defines, static helpers) and is prepended to every
+    section's source before compilation, so each section compiles independently.
+    Each section's entry function is the first non-static function defined
+    after its Address/Inject/Entry comment.
+    """
+    matches  = list(ADDRESS_PATTERN.finditer(source))
+    preamble = source[:matches[0].start()]
+
+    sections = []
+    for i, m in enumerate(matches):
+        start        = m.start()
+        end          = matches[i + 1].start() if i + 1 < len(matches) else len(source)
+        section_text = source[start:end]
+
+        addr = int(m.group(1), 16)
+        if addr % 4 != 0:
+            die(f"Address {hex(addr)} is not 4-byte aligned.")
+        if not (0x80000000 <= addr <= 0x81FFFFFF):
+            warn(f"Address {hex(addr)} is outside typical GameCube RAM.")
+
+        instr_m = INSTRUCTION_PATTERN.search(section_text)
+        sections.append({
+            "address":      addr,
+            "instruction":  instr_m.group(1).strip() if instr_m else None,
+            "source":       preamble + section_text,  # full source passed to compile_c
+            "section_text": section_text,             # slice used for entry func detection
+        })
+
+    return sections
+
+
+def _build_c_section(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
+    """Compile one section of a multi-injection C file into gecko code lines."""
+    addr       = section["address"]
+    instr_text = section["instruction"]
+    func_name  = find_entry_func(section["section_text"])
+
+    tag      = f"sec{idx}_{addr:08x}"
+    src_path = os.path.join(tmpdir, f"{tag}.c")
+    obj_path = os.path.join(tmpdir, f"{tag}.o")
+    elf_path = os.path.join(tmpdir, f"{tag}.elf")
+    ld_path  = os.path.join(tmpdir, f"{tag}.ld")
+
+    print(f"[INFO]   Entry function : {func_name}()")
+
+    rewritten = prepare_source(section["source"], func_name)
+    if debug:
+        print(f"[DEBUG] Section {idx + 1} rewritten source:\n" + rewritten)
+
+    with open(src_path, "w") as f:
+        f.write(rewritten)
+
+    compile_c(src_path, obj_path, debug)
+
+    with open(ld_path, "w") as f:
+        f.write(make_linker_script(func_name))
+    link_elf(obj_path, elf_path, ld_path, debug, entry=func_name)
+
+    disasm = disassemble(elf_path)
+    if debug:
+        print(f"[DEBUG] Section {idx + 1} disassembly:\n" + disasm)
+
+    appended_instr: int | None = None
+    if instr_text:
+        appended_instr = assemble_instruction(instr_text, tmpdir)
+        print(f"[INFO]   Instruction hex : {appended_instr:#010x}")
+
+    payload = build_payload(elf_path, False, set(), debug)
+    payload = pad_and_terminate(payload, appended_instr, debug)
+    lines   = format_c2(addr, payload)
+    print(f"[INFO]   {addr:#010x} → C2  ({len(payload) // 4} words)")
+
+    return lines
 
 CONFIG_PATH = os.path.join(os.path.dirname(SCRIPT_DIR), "config.json")
 TXT_PATH    = os.path.join(os.path.dirname(SCRIPT_DIR), "codes.txt")
@@ -371,9 +543,12 @@ def get_libgcc() -> str:
     return result.stdout.strip()
 
 
-def link_elf(obj_path: str, elf_path: str, ld_path: str, debug: bool):
+def link_elf(obj_path: str, elf_path: str, ld_path: str, debug: bool, entry: str | None = None):
     libgcc = get_libgcc()
-    cmd    = [LD, "-T", ld_path, "--nostdlib", obj_path, libgcc, "-o", elf_path]
+    cmd    = [LD, "-T", ld_path, "--nostdlib"]
+    if entry:
+        cmd += ["--gc-sections", f"--entry={entry}"]
+    cmd   += [obj_path, libgcc, "-o", elf_path]
     if debug:
         print(f"[DEBUG] Link: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -923,7 +1098,115 @@ def main():
 
     base_name = os.path.splitext(os.path.basename(c_path))[0]
     name      = base_name                          # gecko code name (preserves spaces)
-    func_name = re.sub(r'[^a-zA-Z0-9_]', '_', base_name)  # C identifier (spaces -> _)
+    func_name = find_entry_func(source) if not is_asm else re.sub(r'[^a-zA-Z0-9_]', '_', base_name)
+
+    # ── Multi-section ASM ─────────────────────────────────────────────────────
+    if is_asm and len(ADDRESS_PATTERN.findall(source)) > 1:
+        author  = parse_author(source)
+        notes   = parse_notes(source)
+        state   = parse_state(source)
+
+        cond_value: int | None = None
+        cond_addr:  int | None = None
+        if state:
+            cond_addr, cond_value = state
+
+        sections = split_asm_sections(source)
+        print(f"[INFO] Mode           : ASM (multi-injection)")
+        print(f"[INFO] Name           : {name}")
+        print(f"[INFO] Sections       : {len(sections)}")
+        if author: print(f"[INFO] Author         : {author}")
+        if state:  print(f"[INFO] State          : {state[1]:#010x} (conditional wrapper {state[0]:#010x} {state[1]:#010x})")
+
+        check_tools(need_gcc=False)
+
+        tmpdir = tempfile.mkdtemp(prefix="c2gecko_")
+        try:
+            all_code_lines: list[str] = []
+            for i, section in enumerate(sections):
+                print(f"[INFO] Section {i + 1}/{len(sections)} : {section['address']:#010x}"
+                      + (f"  // Instruction: {section['instruction']}" if section['instruction'] else ""))
+                lines = _build_asm_section(section, i, tmpdir, debug)
+                all_code_lines.extend(lines)
+        finally:
+            if not debug:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            else:
+                print(f"[DEBUG] Temp dir: {tmpdir}")
+
+        gecko_code = build_gecko_output(all_code_lines, name, author, notes,
+                                        cond_value, cond_addr)
+
+        ini_path = get_ini_path()
+        if ini_path:
+            deploy_to_ini(ini_path, name, gecko_code, enable)
+            print(f"[INFO] Successfully generated '{name}'")
+            if do_launch:
+                dolphin_path = get_dolphin_path()
+                iso_path     = get_iso_path()
+                if dolphin_path and iso_path:
+                    launch_dolphin(dolphin_path, iso_path)
+        else:
+            warn("No ini_path in config.json — writing to codes.txt.")
+            with open(TXT_PATH, "w", encoding="utf-8") as f:
+                f.write(gecko_code + "\n")
+            print(f"[INFO] Successfully generated '{name}' -> {TXT_PATH}")
+        return
+    # ── End multi-section ASM ─────────────────────────────────────────────────
+
+    # ── Multi-section C ───────────────────────────────────────────────────────
+    if not is_asm and len(ADDRESS_PATTERN.findall(source)) > 1:
+        author  = parse_author(source)
+        notes   = parse_notes(source)
+        state   = parse_state(source)
+
+        cond_value: int | None = None
+        cond_addr:  int | None = None
+        if state:
+            cond_addr, cond_value = state
+
+        sections = split_c_sections(source)
+        print(f"[INFO] Mode           : C (multi-injection)")
+        print(f"[INFO] Name           : {name}")
+        print(f"[INFO] Sections       : {len(sections)}")
+        if author: print(f"[INFO] Author         : {author}")
+        if state:  print(f"[INFO] State          : {state[1]:#010x} (conditional wrapper {state[0]:#010x} {state[1]:#010x})")
+
+        check_tools(need_gcc=True)
+
+        tmpdir = tempfile.mkdtemp(prefix="c2gecko_")
+        try:
+            all_code_lines: list[str] = []
+            for i, section in enumerate(sections):
+                print(f"[INFO] Section {i + 1}/{len(sections)} : {section['address']:#010x}"
+                      + (f"  // Instruction: {section['instruction']}" if section['instruction'] else ""))
+                lines = _build_c_section(section, i, tmpdir, debug)
+                all_code_lines.extend(lines)
+        finally:
+            if not debug:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+            else:
+                print(f"[DEBUG] Temp dir: {tmpdir}")
+
+        gecko_code = build_gecko_output(all_code_lines, name, author, notes,
+                                        cond_value, cond_addr)
+
+        ini_path = get_ini_path()
+        if ini_path:
+            deploy_to_ini(ini_path, name, gecko_code, enable)
+            print(f"[INFO] Successfully generated '{name}'")
+            if do_launch:
+                dolphin_path = get_dolphin_path()
+                iso_path     = get_iso_path()
+                if dolphin_path and iso_path:
+                    launch_dolphin(dolphin_path, iso_path)
+        else:
+            warn("No ini_path in config.json — writing to codes.txt.")
+            with open(TXT_PATH, "w", encoding="utf-8") as f:
+                f.write(gecko_code + "\n")
+            print(f"[INFO] Successfully generated '{name}' -> {TXT_PATH}")
+        return
+    # ── End multi-section C ───────────────────────────────────────────────────
 
     inject_addr = parse_address(source)
     author      = parse_author(source)
@@ -979,7 +1262,7 @@ def main():
         print("[INFO] Linking...")
         with open(ld_path, "w") as f:
             f.write(make_linker_script(func_name))
-        link_elf(obj_path, elf_path, ld_path, debug)
+        link_elf(obj_path, elf_path, ld_path, debug, entry=func_name if not is_asm else None)
 
         disasm = disassemble(elf_path)
         if debug:
