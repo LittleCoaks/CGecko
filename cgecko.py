@@ -275,9 +275,12 @@ def split_asm_sections(source: str) -> list[dict]:
             warn(f"Address {hex(addr)} is outside typical GameCube RAM.")
 
         instr_m = INSTRUCTION_PATTERN.search(text)
+        if instr_m:
+            die(f"// Instruction: is not supported in ASM files "
+                f"(section at {addr:#010x}). Use it only in .c files.")
         sections.append({
             "address":     addr,
-            "instruction": instr_m.group(1).strip() if instr_m else None,
+            "instruction": None,
             "source":      text,
         })
 
@@ -1212,6 +1215,8 @@ def main():
     author      = parse_author(source)
     notes       = parse_notes(source)
     instr_text  = parse_instruction(source)
+    if is_asm and instr_text:
+        die("// Instruction: is not supported in ASM files. Use it only in .c files.")
     state       = parse_state(source)
 
     print(f"[INFO] Mode           : {'ASM' if is_asm else 'C'}")
