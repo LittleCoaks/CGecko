@@ -98,18 +98,18 @@ If provided in `config.json`, the script will also automatically launch Dolphin 
 
 ## Source File Comment System
 
-To specify features of gecko codes (author, injection address, etc) we use comment lines. Both `.c` and `.asm` files use the same comment syntax. C files use `//`, ASM files use `#`.
+To specify features of gecko codes (author, injection address, etc) we use comment lines. Both `.c` and `.asm` files use the same comment syntax, with the exception of `// Instruction:` which is supported only in `.c` files. C files use `//`, ASM files use `#`.
 
 | Comment | Required | Description |
 |---|---|---|
-| `// Address: 0x80XXXXXX` | Yes | Injection address |
+| `// Address: 0x80XXXXXX` | Yes | Injection address. Also accepted: `// Inject:` and `// Entry:` |
 | `// Data: 0x80XXXXXX` | No | RAM address for `.rodata`/`.data`. Required if the code generates static data. |
 | `// Author: YourName` | No | Author for gecko header |
-| `// Instruction: <asm>` | No | PPC instruction appended after RESTORE (re-executes the overwritten instruction) |
+| `// Instruction: <asm>` | No | **C files only.** PPC instruction appended after RESTORE (re-executes the overwritten instruction) |
 | `// *Note text` | No | Note line appended after code block. Repeatable. |
 | `// State: menu\|game\|4\|5` | No | Enables conditional wrapper for MSSB game state* |
 
-The code name is derived automatically from the source filename (e.g. `myCode.c` → `myCode`). The C entry function name replaces spaces with underscores (e.g. `My Code.c` -> `my_code()`).
+The code name is derived automatically from the source filename (e.g. `myCode.c` → `myCode`).
 
 **`// Instruction`** takes a PPC assembly instruction (e.g. `li r3, 0`) and appends it to the very end of the payload, just before the terminator. Use this when the gecko code's branch overwrites an instruction that still needs to execute.
 
@@ -132,7 +132,7 @@ C2XXXXXX LLLLLLLL   <- C3 if address >= 0x81000000
 ...BACKUP...
 ...code...
 ...RESTORE...
-IIIIIIII XXXXXXXX   <- overwritten instruction (only if // Instruction present)
+IIIIIIII XXXXXXXX   <- overwritten instruction (C files only, only if // Instruction present)
 E2000001 00000000   <- conditional close
 *Note text
 ```
@@ -215,9 +215,8 @@ restoreall
 ```asm
 .include "Common.s"
 
-# Author:      YourName
-# Address:     0x80XXXXXX
-# Instruction: nop
+# Author:  YourName
+# Address: 0x80XXXXXX
 # *This is a note
 
 .set pPlayer, r3
@@ -238,14 +237,14 @@ restoreall
 
 The entry function is whatever function the gecko handler will branch to at the memory address specified in the `Address` comment line.
 
-The entry function must match the filename — for `myCode.c`, define `void myCode()`. The script:
+The entry function is the **first non-static function** defined in the file. The script:
 - Injects BACKUP (saves r3–r31, LR, and any used FPRs) before it runs.
 - Injects RESTORE (reloads all saved registers) after it returns.
 - Replaces all `blr` instructions with forward branches to the terminator.
 
-The entry function can't return a value since the automatic stack frame manageament will overwrite the returned value. Therefore just make all entry functions `void`.
+The entry function can't return a value since the automatic stack frame management will overwrite the returned value. Therefore just make all entry functions `void`.
 
-Helper functions (any name other than the entry function) are normal C.
+Helper functions must be declared `static`. This distinguishes them from the entry function and allows the linker to strip helpers that go unused.
 
 ### Register Access
  
@@ -391,14 +390,14 @@ Or use `// Data:` to place string constants at a reserved RAM address if you pre
 // Game functions (types only — no parameter names)
 #define PlaySound FUNCTION_ADDRESS(void, 0x800c836C, int, int, int, int)
 
-// Helpers
+// Helpers — must be static
 static int clamp(int val, int min, int max) {
     if (val < min) return min;
     if (val > max) return max;
     return val;
 }
 
-// Entry function — name matches filename
+// Entry function — first non-static function in the file
 void myCode() {
     READ_GAME_REG(int, currentScore, 20);   // r20 at injection point
 
@@ -411,6 +410,66 @@ void myCode() {
     PlaySound(0x1, 127, 0x3f, 0x0);
 }
 ```
+
+---
+
+## Multi-Injection Files
+
+Both `.asm` and `.c` files support multiple injection points in a single file. Each injection section begins with an `// Address:` (or `// Inject:` / `// Entry:`) comment and is assembled or compiled independently. All sections are combined into one `$Name` gecko code block — each gets its own C2 or 04 entry under the shared header.
+
+File-level comments (`// Author:`, `// State:`, `// *Note`) go before the first address comment and apply to the whole block.
+
+### ASM
+
+Each section assembles independently. `.set` aliases are global within the file, so ensure names don't collide across sections.
+
+```asm
+.include "Common.s"
+
+# Author: Me
+# State:  game
+
+# Address: 0x80123456
+    backupall
+    lwz  r4, 0x10(r3)
+    addi r4, r4, 1
+    stw  r4, 0x10(r3)
+    restoreall
+
+# Address: 0x80789ABC
+# *Resets the combo counter
+    li  r5, 0
+    stw r5, 0x20(r3)
+```
+
+### C
+
+Everything before the first address comment is the **preamble** — shared includes, `#define`s, and `static` helpers that are compiled into every section. Each section's entry function is the first non-static function defined after its address comment.
+
+```c
+#include "Common.h"
+
+// Author: Me
+// State:  game
+
+// Shared across all sections
+#define gScore VAR_ADDRESS(int, 0x80100000)
+static int clamp(int val, int min, int max) { ... }
+
+// Address: 0x80123456
+void PatchA() {
+    READ_GAME_REG(int, score, 3);
+    gScore = clamp(score + 10, 0, 99999);
+}
+
+// Address: 0x80789ABC
+// Instruction: nop
+void PatchB() {
+    gScore = 0;
+}
+```
+
+**Cross-section references are not allowed.** A function or variable defined in one section's slice is not visible to another section. Anything shared between sections belongs in the preamble. The compiler will give an undefined symbol error if you attempt to reference across sections, which is the intended behavior.
 
 ---
 
