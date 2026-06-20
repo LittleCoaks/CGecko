@@ -162,8 +162,13 @@ def parse_state(source: str) -> tuple[int, int] | None:
     if key not in STATE_MAP:
         die(f"Unknown State value '{key}'. Expected: boot, menu, game, 0, 4, or 5.")
     return STATE_MAP[key]
-def parse_notes(source: str) -> list[str]:
-    return [m.group(1).strip() for m in NOTE_PATTERN.finditer(source)]
+def parse_notes(source: str, is_asm: bool = False) -> list[str]:
+    # A note is the file's comment marker directly followed by '*': '// *' in C,
+    # '# *' in ASM. Keying off the language-specific marker stops a C block
+    # comment's close ('###*/' — a '#' right before '*') being read as a note.
+    marker  = r"#" if is_asm else r"//"
+    pattern = re.compile(rf"(?:{marker})\s*(\*[^\n]*)", re.MULTILINE)
+    return [m.group(1).strip() for m in pattern.finditer(source)]
 # Matches the first non-static function signature in a source slice.
 # Does not include 'static' in the alternation, so static helpers are skipped.
 _FUNC_DEF_PATTERN = re.compile(
@@ -1201,7 +1206,7 @@ def main():
     name      = base_name                      # gecko code name (preserves spaces)
 
     author = parse_author(source)
-    notes  = parse_notes(source)
+    notes  = parse_notes(source, is_asm)
     state  = parse_state(source)
     cond_addr, cond_value = state if state else (None, None)
 
