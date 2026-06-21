@@ -9,7 +9,13 @@
 
 /* ── Type aliases ────────────────────────────────────────────────────────── */
 
-#ifndef __cplusplus // avoid false positive errors in IDEs
+/* bool/true/false are built-in keywords in C++ and in the C23 era. GCC makes
+ * them keywords in -std=c2x (draft, __STDC_VERSION__ == 202000L) AND -std=c23
+ * (final, 202311L) — and GCC 15 defaults to gnu23 — so test for >= 202000L, not
+ * just the final value. Only define them ourselves on C17 and earlier; the
+ * built-ins are used otherwise. The __cplusplus half also avoids IDE false
+ * positives when an editor parses this header as C++. */
+#if !defined(__cplusplus) && (!defined(__STDC_VERSION__) || __STDC_VERSION__ < 202000L)
 typedef unsigned char bool;
 #define false 0
 #define true  1
