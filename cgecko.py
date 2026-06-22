@@ -574,27 +574,58 @@ def pic_stub_bytes() -> bytes:
 def replace_blr(text: bytes, data_after: int, debug: bool) -> bytes:
     text_len = len(text)
     words    = list(struct.unpack(f">{text_len // 4}I", text))
-    count    = 0
+
+    def is_return_to_lr(w: int) -> bool:
+        # bclrx: primary opcode 19, extended opcode 16, LK=0. This matches blr and
+        # every conditional return (beqlr, bnelr, bltlr, ...). It deliberately does
+        # NOT match bcctr/bctr (ext op 528) -- those are FUNCTION_ADDRESS calls -- or
+        # blrl (LK=1, a call through LR).
+        return (w >> 26) == 19 and ((w >> 1) & 0x3FF) == 16 and (w & 1) == 0
+
+    def is_unconditional(bo: int) -> bool:
+        return (bo & 0b10100) == 0b10100   # BO = 1z1zz -> branch always
+
+    # Only a trailing UNCONDITIONAL blr can be dropped to fall through to RESTORE,
+    # and only when nothing (PIC data) sits between text and RESTORE.
     drop_tail     = bool(words) and words[-1] == BLR_INSTR and data_after == 0
     effective_len = text_len - (4 if drop_tail else 0)
+
+    uncond = cond = 0
     for i, word in enumerate(words):
-        if word == BLR_INSTR:
-            count += 1
+        if not is_return_to_lr(word):
+            continue
+        instr_offset = i * 4
+        delta = (effective_len - instr_offset) + data_after
+        bo = (word >> 21) & 0x1F
+        bi = (word >> 16) & 0x1F
+        if is_unconditional(bo):
+            uncond += 1
             if drop_tail and i == len(words) - 1:
-                continue  # stripped below; falls through to RESTORE naturally
-            instr_offset = i * 4
-            delta  = (effective_len - instr_offset) + data_after
-            branch = B_BASE | (delta & 0x03FFFFFC)
+                continue  # popped below; falls through to RESTORE naturally
+            words[i] = B_BASE | (delta & 0x03FFFFFC)
             if debug:
                 print(f"[DEBUG] blr at .text+{instr_offset:#05x} -> b +{delta} (skips {data_after} data bytes)")
-            words[i] = branch
+        else:
+            cond += 1
+            # Rewrite the conditional return as a bc with the SAME BO/BI, branching
+            # forward to RESTORE so the early-exit path still runs the epilogue.
+            if not (0 <= delta <= 0x7FFC):
+                die(f"conditional return at .text+{instr_offset:#x} is {delta} bytes from "
+                    f"RESTORE — too far to encode as a bc (max 0x7FFC). Simplify the code "
+                    f"or split it across sections.")
+            words[i] = (16 << 26) | (bo << 21) | (bi << 16) | (delta & 0x0000FFFC)
+            if debug:
+                print(f"[DEBUG] conditional return (BO={bo}, BI={bi}) at .text+{instr_offset:#05x} "
+                      f"-> bc +{delta} to RESTORE")
     if drop_tail:
         words.pop()
+        uncond -= 1  # the dropped blr is not a replacement
         if debug:
-            print(f"[DEBUG] blr at .text+{effective_len:#05x} — dropped (falls through to RESTORE)")
-    replaced = count - (1 if drop_tail else 0)
-    if replaced:
-        print(f"[INFO] Replaced {replaced} blr(s) with forward branch(es) past data to RESTORE.")
+            print(f"[DEBUG] trailing blr at .text+{effective_len:#05x} — dropped (falls through to RESTORE)")
+    total = uncond + cond
+    if total:
+        print(f"[INFO] Routed {total} return(s) to RESTORE "
+              f"({cond} conditional, {uncond} unconditional branch(es)).")
     return struct.pack(f">{len(words)}I", *words)
 # ==============================================================================
 # SOURCE REWRITING  (C only)
@@ -786,7 +817,7 @@ def warn(msg: str):
 # ==============================================================================
 # DOLPHIN INI DEPLOY
 # ==============================================================================
-def deploy_to_ini(ini_path: str, name: str, gecko_code: str, enable: bool = True):
+def deploy_to_ini(ini_path: str, name: str, gecko_code: str, enable: bool = True, force: bool = False):
     code_lines = gecko_code.strip().splitlines()
     new_header = code_lines[0]
     new_body   = code_lines[1:]
@@ -845,7 +876,15 @@ def deploy_to_ini(ini_path: str, name: str, gecko_code: str, enable: bool = True
     enabled_body  = lines[enabled_idx + 1:]
     enabled_names = [l.strip() for l in enabled_body if l.strip()]
     enabled_entry = f"${target_name}"
-    if enable and not found and enabled_entry not in enabled_names:
+    present = enabled_entry in enabled_names
+    if force:
+        # Apply the requested state no matter what, overriding any existing toggle.
+        if enable and not present:
+            enabled_names.append(enabled_entry)
+        elif not enable and present:
+            enabled_names = [n for n in enabled_names if n != enabled_entry]
+    elif enable and not found and not present:
+        # Soft: only set the state when adding a NEW code; leave existing toggles alone.
         enabled_names.append(enabled_entry)
     new_enabled_lines = ["", "[Gecko_Enabled]"]
     new_enabled_lines.extend(enabled_names)
@@ -1150,13 +1189,26 @@ def main():
                         help="Input .c or .asm file. If omitted, uses build_file from config.json.")
     parser.add_argument("-d", action="store_true",
                         help="Debug mode: verbose output, save build artifacts")
-    parser.add_argument("--no-enable", action="store_true",
-                        help="Do not add the code to [Gecko_Enabled] in the ini")
+    # Post-build enabled state in the ini. With neither flag the behavior is
+    # unchanged: a newly added code is enabled, and an existing code keeps its
+    # current toggle. --enabled / --disabled set the final state outright,
+    # overriding an existing code's toggle either way.
+    state = parser.add_mutually_exclusive_group()
+    state.add_argument("--enabled", dest="enable_mode", action="store_const", const="enabled",
+                       help="Make the code enabled after building, overriding any existing toggle.")
+    state.add_argument("--disabled", dest="enable_mode", action="store_const", const="disabled",
+                       help="Make the code disabled after building, overriding any existing toggle.")
+    state.add_argument("--no-enable", dest="enable_mode", action="store_const", const="no_enable",
+                       help="Legacy: don't enable a newly added code, but leave existing toggles alone.")
     parser.add_argument("--no-launch", action="store_true",
                         help="Do not launch Dolphin after building, even if config says to")
     args = parser.parse_args()
     debug   = args.d
-    enable  = not args.no_enable
+    # enable_mode: None = default (enable a new code, preserve an existing toggle);
+    # "enabled"/"disabled" force that final state; "no_enable" = legacy soft disable
+    # (don't enable a new code, but leave existing toggles alone).
+    enable = args.enable_mode not in ("disabled", "no_enable")   # None and "enabled" -> True
+    force  = args.enable_mode in ("enabled", "disabled")
     do_launch = get_launch() and not args.no_launch
     input_arg = args.input
     if input_arg is None:
@@ -1189,7 +1241,7 @@ def main():
         ini_path = get_ini_path()
         if ini_path:
             for blk_name, gecko_code in blocks:
-                deploy_to_ini(ini_path, blk_name, gecko_code, enable)
+                deploy_to_ini(ini_path, blk_name, gecko_code, enable, force)
             print(f"[INFO] Successfully deployed {len(blocks)} code(s)")
             if do_launch:
                 dolphin_path = get_dolphin_path()
@@ -1249,7 +1301,7 @@ def main():
 
         ini_path = get_ini_path()
         if ini_path:
-            deploy_to_ini(ini_path, name, gecko_code, enable)
+            deploy_to_ini(ini_path, name, gecko_code, enable, force)
             print(f"[INFO] Successfully generated '{name}'")
             if do_launch:
                 dolphin_path = get_dolphin_path()
