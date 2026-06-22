@@ -1,2 +1,2 @@
 #!/bin/bash
-python "$(dirname "$0")/cgecko.py"
+python "$(dirname "$0")/cgecko.py" "$@"

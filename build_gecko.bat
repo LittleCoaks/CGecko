@@ -1,2 +1,2 @@
 @echo off
-python "%~dp0cgecko.py"
+python "%~dp0cgecko.py" %*

@@ -3,6 +3,7 @@
 
 import sys
 import os
+import argparse
 import subprocess
 import glob
 
@@ -21,7 +22,30 @@ def find_sources() -> list[str]:
     return sorted(sources)
 
 
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Build every .c, .asm, and .ini gecko code in the repo."
+    )
+    # Forwarded to cgecko to control each built code's enabled state in the ini.
+    # The default leaves toggles alone: a newly added code isn't enabled and an
+    # existing code keeps its current state, so a batch rebuild doesn't flip
+    # anything. --enabled / --disabled override that for every code at once.
+    state = parser.add_mutually_exclusive_group()
+    state.add_argument("--enabled", dest="state", action="store_const", const="--enabled",
+                       help="Force every built code enabled in the ini, overriding existing toggles.")
+    state.add_argument("--disabled", dest="state", action="store_const", const="--disabled",
+                       help="Force every built code disabled in the ini, overriding existing toggles.")
+    state.add_argument("--no-enable", dest="state", action="store_const", const="--no-enable",
+                       help="Default: don't enable newly added codes; leave existing toggles alone.")
+    # Anything else (e.g. -d) is forwarded to cgecko untouched.
+    args, passthrough = parser.parse_known_args(argv)
+    return args, passthrough
+
+
 def main():
+    args, passthrough = parse_args()
+    state_flag = args.state or "--no-enable"
+
     sources = find_sources()
     if not sources:
         print("[INFO] No .c, .asm, or .ini source files found.")
@@ -38,7 +62,7 @@ def main():
         print(f"Building: {rel}")
         print(f"{'─' * 60}")
         result = subprocess.run(
-            [sys.executable, CGECKO, "--no-enable", "--no-launch", src],
+            [sys.executable, CGECKO, state_flag, "--no-launch", *passthrough, src],
             stdin=subprocess.DEVNULL,
         )
         if result.returncode == 0:
