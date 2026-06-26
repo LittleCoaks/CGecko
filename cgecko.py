@@ -697,7 +697,7 @@ _BRANCH_OPS = {16, 18, 19}
 def patch_lis_for_pic(text: bytes) -> bytes:
     """Eliminate every 'lis rN, 0' emitted for .picdata access.
     GCC links .picdata at address 0 and emits 'lis rN, 0' as the upper-half
-    load for each static data address.  We remove the lis entirely and
+    load for each static data address.  We nop the lis in place and
     propagate r31 into the rA field of downstream instructions that used rN
     as a base — until rN is redefined or a branch is reached.
     Result: 'lis r9, 0 / lfs f1, 0(r9)' becomes 'lfs f1, 0(r31)'."""
@@ -719,9 +719,15 @@ def patch_lis_for_pic(text: bytes) -> bytes:
             if rD == rN and op in _GPR_WRITE_OPS:
                 break
         to_remove.add(i)
-    words = [w for idx, w in enumerate(words) if idx not in to_remove]
+    # Overwrite each dead 'lis rN, 0' with a nop IN PLACE. Do NOT delete it:
+    # removing a word shifts every later instruction down by 4, and nothing here
+    # relocates branch targets, so any branch straddling the deletion lands 4 bytes
+    # off (per deletion). That silently corrupts control flow whenever .picdata exists.
+    NOP = 0x60000000  # ori r0, r0, 0
+    for idx in to_remove:
+        words[idx] = NOP
     if to_remove:
-        print(f"[INFO] PIC: removed {len(to_remove)} 'lis rN, 0', base uses → r31")
+        print(f"[INFO] PIC: nop'd {len(to_remove)} 'lis rN, 0', base uses → r31")
     return struct.pack(f">{len(words)}I", *words)
 def build_payload(elf_path: str,
                   raw_mode: bool,
