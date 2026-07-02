@@ -100,55 +100,6 @@ typedef unsigned int   word;
 
 #define READ_REG(type, name, num) register type name __asm__(#num)
 
-/* ── Stack data helpers ─────────────────────────────────────────────────────── */
-/*
- * FLOATS — do not declare float constants of any kind.
- *
- * Float literals produce .rodata, which uses absolute addresses invalid at an
- * unknown payload address. The build will error on any .rodata/.data output.
- *
- * To use float values, read them from game memory:
- *   float speed = VAR_ADDRESS(float, 0x80123456);
- *
- * Float arithmetic between game-memory values is fine:
- *   gSpeed = gSpeed * gSpeed2;   // both loaded via lfs, result stored via stfs
- */
-
-/*
- * Stack arrays — declare and initialize normally:
- *   int  arr[4] = {10, 20, 30, 40};   // fine — lives on the stack
- *   arr[2] = arr[0] + arr[1];         // fine
- *
- * Do NOT use static or global arrays — those go into .rodata/.data and
- * generate absolute address relocations that break in a gecko payload.
- * The BACKUP frame provides 0x90 bytes of stack space (minus what GCC uses),
- * sufficient for small arrays.
- */
-
-/* ── String helpers ─────────────────────────────────────────────────────────── */
-/*
- * Strings cannot be declared as literals (const char* or char[] = "...") in
- * gecko injection code — they generate .rodata which uses absolute addresses
- * invalid at an unknown payload address.
- *
- * Use a char array initializer list instead — each element is an integer
- * constant and stays on the stack:
- *
- *   char msg[] = {'H','e','l','l','o','!','\0'};   // ✅ stack only
- *   OSReport(msg);
- *
- * For longer strings, STR4/STR2/STR1 pack multiple chars per store:
- *
- *   char buf[8];
- *   STR4(buf+0, 'H','e','l','l');  // stores 4 chars at buf+0
- *   STR2(buf+4, 'o','!');          // stores 2 chars at buf+4
- *   STR1(buf+6, '\0');             // stores null terminator
- *   OSReport(buf);
- */
-#define STR4(buf, a, b, c, d) (*(int  *)(buf) = ((a)<<24)|((b)<<16)|((c)<<8)|(d))
-#define STR2(buf, a, b)       (*(short*)(buf) = ((a)<< 8)|(b))
-#define STR1(buf, a)          (*(char *)(buf) = (a))
-
 /* ── Utilities ───────────────────────────────────────────────────────────── */
 
 #define LEN(a)          (sizeof(a) / sizeof(*a))    // number of elements in array
@@ -166,10 +117,6 @@ typedef unsigned int   word;
  *     READ_GAME_REG(int, score, 30);   // reads saved r30
  *     WRITE_GAME_REG(30, score + 1);  // game sees r30+1 after gecko code returns
  *   Only valid in the entry function, not in helpers.
- *
- * FLOATS:
- *   Do not declare float constants — use VAR_ADDRESS to read floats from game memory.
- *   Float arithmetic between game-memory floats is fine.
  */
 
 #endif /* COMMON_H */
