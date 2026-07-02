@@ -28,30 +28,20 @@ typedef unsigned int   word;
 /* ── Memory access ───────────────────────────────────────────────────────── */
 /*
  * VAR_ADDRESS(type, addr)                  — single value
- * VAR_ADDRESS(type, count, addr)           — 1D array
- * VAR_ADDRESS(type, rows, cols, addr)      — 2D array
+ * ARRAY_1D_ADDRESS(type, count, addr)           — 1D array
+ * ARRAY_2D_ADDRESS(type, rows, cols, addr)      — 2D array
  *
  * Examples:
  *   VAR_ADDRESS(int,  0x80123456) = 10;
  *   int x = VAR_ADDRESS(int, 0x80123456);
  *   VAR_ADDRESS(byte, 4, 0x80AABBCC)[2] = 0xFF;
  */
-#define GET_MACRO(_1,_2,_3,_4,NAME,...) NAME
-#define VAR_ADDRESS(...) \
-    GET_MACRO(__VA_ARGS__, \
-        arrayValue5D_atAddr, \
-        arrayValue4D_atAddr, \
-        arrayValue3D_atAddr, \
-        arrayValue2D_atAddr, \
-        arrayValue_atAddr, \
-        singleValue_atAddr)(__VA_ARGS__)
-
-#define singleValue_atAddr(type, addr)                              (*(type *)(addr))
-#define arrayValue_atAddr(type, count, addr)                        (*(type (*)[count])(addr))
-#define arrayValue2D_atAddr(type, rows, cols, addr)                 (*(type (*)[rows][cols])(addr))
-#define arrayValue3D_atAddr(type, x, y, z, addr)                    (*(type (*)[x][y][z])(addr))
-#define arrayValue4D_atAddr(type, a, b, c, d, addr)                 (*(type (*)[a][b][c][d])(addr))
-#define arrayValue5D_atAddr(type, a, b, c, d, e, addr)              (*(type (*)[a][b][c][d][e])(addr))
+#define VAR_ADDRESS(type, addr) (*(type *)(addr))
+#define ARRAY_1D_ADDRESS(type, n, addr) (*(type (*)[n])(addr))
+#define ARRAY_2D_ADDRESS(type, r, c, addr) (*(type (*)[r][c])(addr))
+#define ARRAY_3D_ADDRESS(type, x, y, z, addr) (*(type (*)[x][y][z])(addr))
+#define ARRAY_4D_ADDRESS(type, a, b, c, d, addr) (*(type (*)[a][b][c][d])(addr))
+#define ARRAY_5D_ADDRESS(type, a, b, c, d, e, addr) (*(type (*)[a][b][c][d][e])(addr))
 
 /* ── Function calls ──────────────────────────────────────────────────────── */
 /*
