@@ -37,11 +37,19 @@ typedef unsigned int   word;
  *   VAR_ADDRESS(byte, 4, 0x80AABBCC)[2] = 0xFF;
  */
 #define GET_MACRO(_1,_2,_3,_4,NAME,...) NAME
-#define VAR_ADDRESS(...) GET_MACRO(__VA_ARGS__, arrayValue2D_atAddr, arrayValue_atAddr, singleValue_atAddr)(__VA_ARGS__)
+#define VAR_ADDRESS(...) \
+    GET_MACRO(__VA_ARGS__, \
+        arrayValue4D_atAddr, \
+        arrayValue3D_atAddr, \
+        arrayValue2D_atAddr, \
+        arrayValue_atAddr, \
+        singleValue_atAddr)(__VA_ARGS__)
 
-#define singleValue_atAddr(type, addr)                    (*(type *)(addr))
-#define arrayValue_atAddr(type, count, addr)              (*(type (*)[count])(addr))
-#define arrayValue2D_atAddr(type, rows, cols, addr)       (*(type (*)[rows][cols])(addr))
+#define singleValue_atAddr(type, addr)                         (*(type *)(addr))
+#define arrayValue_atAddr(type, count, addr)                   (*(type (*)[count])(addr))
+#define arrayValue2D_atAddr(type, rows, cols, addr)            (*(type (*)[rows][cols])(addr))
+#define arrayValue3D_atAddr(type, x, y, z, addr)               (*(type (*)[x][y][z])(addr))
+#define arrayValue4D_atAddr(type, a, b, c, d, addr)            (*(type (*)[a][b][c][d])(addr))
 
 /* ── Function calls ──────────────────────────────────────────────────────── */
 /*
