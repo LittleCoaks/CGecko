@@ -119,4 +119,25 @@ typedef unsigned int   word;
  *   Only valid in the entry function, not in helpers.
  */
 
+ /* ── Float helpers ────────────────────────────────────────────────────────── */
+// cpp2gecko implementation
+// _scratch lets the compiler choose an available reg
+#define LOAD_FLOAT(value, result_reg) do { \
+    union { float f; unsigned int i; } _bits = {.f = (value)}; \
+    unsigned int _scratch;  \
+    asm("lis %1, %2\n\t" \
+        "ori %1, %1, %3\n\t" \
+        "stw %1, -8(1)\n\t" \
+        "lfs %0, -8(1)" \
+        : "=f"(result_reg), "=&r"(_scratch) \
+        : "n"((short)(_bits.i >> 16)), "n"((unsigned short)(_bits.i & 0xFFFF)) \
+        : "memory"); \
+} while(0)
+
+#define FP(x) ({ \
+    register float _fp_tmp; \
+    LOAD_FLOAT((x), _fp_tmp); \
+    _fp_tmp; \
+})
+
 #endif /* COMMON_H */
