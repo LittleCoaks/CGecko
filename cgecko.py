@@ -34,6 +34,10 @@ GCC_FLAGS = [
     "-mcpu=750",
     "-meabi",
     "-mno-sdata",    # all static data goes to .rodata/.data, accessed via lis/ori (PIC-patchable)
+    "-fno-jump-tables",  # switch/if-chain jump tables embed link-time code addresses,
+                         # which are wrong at runtime (payload layout differs by the
+                         # 4-byte mflr r31 between .picdata and .text, and code is
+                         # never relocated) -- force compare chains instead
     "-mhard-float",
     "-fomit-frame-pointer",
     "-ffunction-sections",
@@ -328,7 +332,7 @@ def _build_c_section(section: dict, idx: int, tmpdir: str, debug: bool) -> list[
     if instr_text:
         appended_instr = assemble_instruction(instr_text, tmpdir)
         print(f"[INFO]   Instruction hex : {appended_instr:#010x}")
-    payload = build_payload(elf_path, False, set(), debug)
+    payload = build_payload(elf_path, False, set(), debug, entry=func_name)
     payload = pad_and_terminate(payload, appended_instr, debug)
     lines   = format_c2(addr, payload)
     print(f"[INFO]   {addr:#010x} → C2  ({len(payload) // 4} words)")
@@ -571,7 +575,42 @@ def pic_stub_bytes() -> bytes:
 # ==============================================================================
 # BLR REPLACEMENT
 # ==============================================================================
-def replace_blr(text: bytes, data_after: int, debug: bool) -> bytes:
+def get_entry_extent(elf_path: str, entry: str) -> int | None:
+    """Return the byte extent of the entry function within .text (its offset
+    from the start of .text plus its size), or None if it can't be determined.
+    Used to limit blr rewriting to the entry function: a helper function's blr
+    is a genuine return to its caller and must NOT be routed to RESTORE."""
+    try:
+        sec = subprocess.run([READELF, "-SW", elf_path],
+                             capture_output=True, text=True).stdout
+        text_addr = None
+        for line in sec.splitlines():
+            m = re.search(r"\.text\s+\S+\s+([0-9A-Fa-f]+)", line)
+            if m:
+                text_addr = int(m.group(1), 16)
+                break
+        if text_addr is None:
+            return None
+        syms = subprocess.run([READELF, "-sW", elf_path],
+                              capture_output=True, text=True).stdout
+        for line in syms.splitlines():
+            parts = line.split()
+            if len(parts) >= 8 and parts[3] == "FUNC" and parts[7] == entry:
+                value = int(parts[1], 16)
+                size  = int(parts[2], 0)
+                if size == 0:
+                    return None
+                return (value - text_addr) + size
+    except Exception:
+        pass
+    return None
+def replace_blr(text: bytes, data_after: int, debug: bool,
+                entry_extent: int | None = None) -> bytes:
+    """Route returns to RESTORE. When entry_extent is given (C builds), only
+    returns inside [0, entry_extent) — the entry function, which the linker
+    script places first in .text — are rewritten; helper functions keep their
+    blr so they return to their caller. When None (ASM builds), every blr is
+    treated as a return to the game, preserving historical behavior."""
     text_len = len(text)
     words    = list(struct.unpack(f">{text_len // 4}I", text))
 
@@ -586,8 +625,10 @@ def replace_blr(text: bytes, data_after: int, debug: bool) -> bytes:
         return (bo & 0b10100) == 0b10100   # BO = 1z1zz -> branch always
 
     # Only a trailing UNCONDITIONAL blr can be dropped to fall through to RESTORE,
-    # and only when nothing (PIC data) sits between text and RESTORE.
-    drop_tail     = bool(words) and words[-1] == BLR_INSTR and data_after == 0
+    # and only when nothing (PIC data) sits between text and RESTORE. When helper
+    # functions follow the entry, the trailing blr belongs to a helper — keep it.
+    drop_tail     = (bool(words) and words[-1] == BLR_INSTR and data_after == 0
+                     and (entry_extent is None or entry_extent >= text_len))
     effective_len = text_len - (4 if drop_tail else 0)
 
     uncond = cond = 0
@@ -595,6 +636,8 @@ def replace_blr(text: bytes, data_after: int, debug: bool) -> bytes:
         if not is_return_to_lr(word):
             continue
         instr_offset = i * 4
+        if entry_extent is not None and instr_offset >= entry_extent:
+            continue  # helper function's return — a real blr to its caller
         delta = (effective_len - instr_offset) + data_after
         bo = (word >> 21) & 0x1F
         bi = (word >> 16) & 0x1F
@@ -732,7 +775,8 @@ def patch_lis_for_pic(text: bytes) -> bytes:
 def build_payload(elf_path: str,
                   raw_mode: bool,
                   extra_fprs: set[int],
-                  debug: bool) -> bytes:
+                  debug: bool,
+                  entry: str | None = None) -> bytes:
     """Assemble the final C2 payload bytes.
     PIC layout when .picdata is non-empty:
         BACKUP
@@ -755,10 +799,17 @@ def build_payload(elf_path: str,
         print(f"[DEBUG] .picdata : {len(picdata)} bytes")
     if raw_mode:
         return replace_blr(text, 0, debug)
+    entry_extent = get_entry_extent(elf_path, entry) if entry else None
+    if entry and entry_extent is None:
+        warn(f"Could not measure entry '{entry}' in the ELF — routing EVERY blr "
+             f"to RESTORE. Helper function returns will be broken; inline them.")
+    elif entry_extent is not None and debug:
+        print(f"[DEBUG] Entry extent: {entry_extent:#x} bytes "
+              f"(blrs past this stay as helper returns)")
     # Patch lis rN,0 → nop + base propagation before blr replacement
     if picdata:
         text = patch_lis_for_pic(text)
-    text = replace_blr(text, 0, debug)
+    text = replace_blr(text, 0, debug, entry_extent)
     used_fprs  = detect_used_fprs(text, extra_fprs, debug)
     frame_size = compute_frame_size(used_fprs)
     backup     = build_backup(frame_size, used_fprs)
@@ -1029,7 +1080,7 @@ def _build_c0_c(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
     link_elf(obj_path, elf_path, ld_path, debug, entry=func_name)
     if debug:
         print(f"[DEBUG] C0 disassembly:\n" + disassemble(elf_path))
-    payload = build_payload(elf_path, False, set(), debug)     # BACKUP + body(blr->RESTORE) + RESTORE
+    payload = build_payload(elf_path, False, set(), debug, entry=func_name)  # BACKUP + body(blr->RESTORE) + RESTORE
     payload = payload + struct.pack(">I", BLR_INSTR)           # return to the codehandler
     payload = terminate_c0(payload)                            # pad to a whole 8-byte line
     lines   = format_c0(payload)
