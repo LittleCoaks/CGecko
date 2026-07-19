@@ -140,4 +140,17 @@ typedef unsigned int   word;
     _fp_tmp; \
 })
 
+// Patch one instruction, only when the expected original is there
+// (idempotent: after patching, the site no longer matches, and a
+// freshly reloaded REL matches again). The cache ops keep it
+// correct on real hardware; Dolphin doesn't need them.
+static inline __attribute__((always_inline)) void PatchInstruction(word addr, word original, word replacement)
+{
+    volatile word* site = (volatile word*)addr;
+    if (*site != original)
+        return;
+    *site = replacement;
+    asm volatile("dcbst 0,%0\n\tsync\n\ticbi 0,%0\n\tisync" :: "r"(site) : "memory");
+}
+
 #endif /* COMMON_H */
