@@ -166,6 +166,13 @@ def parse_state(source: str) -> tuple[int, int] | None:
     if key not in STATE_MAP:
         die(f"Unknown State value '{key}'. Expected: boot, menu, game, 0, 4, or 5.")
     return STATE_MAP[key]
+def parse_file_state(source: str) -> tuple[int, int] | None:
+    """File-level State: — read ONLY from the preamble (everything before the
+    first // Address:). A State: inside a section belongs to that section, and
+    must not be picked up here as though it applied to the whole file."""
+    m = ADDRESS_PATTERN.search(source)
+    head = source[:m.start()] if m else source
+    return parse_state(head)
 def parse_notes(source: str, is_asm: bool = False) -> list[str]:
     # A note is the file's comment marker directly followed by '*': '// *' in C,
     # '# *' in ASM. Keying off the language-specific marker stops a C block
@@ -1219,18 +1226,24 @@ def split_codes(source: str, is_asm: bool) -> list[dict]:
         if not (0x80000000 <= addr <= 0x81FFFFFF):
             warn(f"Address {hex(addr)} is outside typical GameCube RAM.")
 
+        # A State: inside this slice gates THIS injection only, so one gecko
+        # code can mix e.g. a menu-rel hook with game-rel hooks.
+        sec_state = parse_state(section_text)
+
         instr_m = INSTRUCTION_PATTERN.search(section_text)
         if is_asm:
             if instr_m:
                 warn(f"// Instruction: is ignored in ASM files "
                      f"(section at {addr:#010x}).")
             sections.append({"type": "c2", "address": addr,
-                             "instruction": None, "source": section_text})
+                             "instruction": None, "source": section_text,
+                             "state": sec_state})
         else:
             sections.append({"type": "c2", "address": addr,
                              "instruction": instr_m.group(1).strip() if instr_m else None,
                              "source": preamble + section_text,
-                             "section_text": section_text})
+                             "section_text": section_text,
+                             "state": sec_state})
 
     return sections
 
@@ -1316,7 +1329,7 @@ def main():
 
     author = parse_author(source)
     notes  = parse_notes(source, is_asm)
-    state  = parse_state(source)
+    state  = parse_file_state(source)
     cond_addr, cond_value = state if state else (None, None)
 
     sections = split_codes(source, is_asm)
@@ -1333,7 +1346,7 @@ def main():
     if author:
         print(f"[INFO] Author         : {author}")
     if state:
-        print(f"[INFO] State          : conditional wrapper "
+        print(f"[INFO] State          : file-level conditional wrapper "
               f"{state[0]:#010x} {state[1]:#010x}")
 
     check_tools(need_gcc=not is_asm)
@@ -1346,9 +1359,19 @@ def main():
                    else "leading region")
             extra = (f"  // Instruction: {section['instruction']}"
                      if section.get("instruction") else "")
+            sec_state = section.get("state")
+            if sec_state:
+                extra += f"  // State: {sec_state[0]:#010x} {sec_state[1]:#010x}"
             print(f"[INFO] Section {i + 1}/{len(sections)} : "
                   f"{section['type'].upper():3} @ {loc}{extra}")
-            all_code_lines.extend(_build_section(section, i, tmpdir, is_asm, debug))
+
+            lines = _build_section(section, i, tmpdir, is_asm, debug)
+            if sec_state:
+                # gate this injection alone; nests fine inside a file-level State
+                s_addr, s_val = sec_state
+                lines = ([f"{s_addr:08X} {s_val:08X}"] + lines
+                         + ["E2000001 00000000"])
+            all_code_lines.extend(lines)
 
         if not all_code_lines:
             die("No gecko code lines were generated.")
