@@ -1,6 +1,8 @@
 /*
  * Common.h
- * Helper macros and type definitions for C gecko code injection on GameCube.
+ * Hook declarations, helper macros, and type definitions for C gecko code
+ * injection on GameCube. cgecko force-includes this header into every C mod,
+ * so an explicit #include is optional (and harmless).
  * See README.md for full documentation. For ASM macros, see Common.s.
  */
 
@@ -24,6 +26,93 @@ typedef unsigned char bool;
 typedef unsigned char  byte;
 typedef unsigned short halfword;
 typedef unsigned int   word;
+
+/* ── Hook declarations ───────────────────────────────────────────────────────
+ *
+ * Declare each hook with CGECKO_HOOK (an injection at a game address) or
+ * CGECKO_FRAME (a per-frame code). cgecko reads these records straight out of
+ * the compiled object's `.cgecko_hooks` section, so the metadata survives
+ * #include and travels with the code it belongs to — unlike a comment, which
+ * the preprocessor discards.
+ *
+ * A hook is an ordinary `void name(void)` function. cgecko wraps it: it saves
+ * the game's registers, establishes the PIC base (r31), CALLS your function,
+ * then restores the game's registers and hands control back. Write normal C —
+ * locals, helper calls, and READ_GAME_REG/WRITE_GAME_REG (below) all work in
+ * the hook body.
+ *
+ *     CGECKO_HOOK(on_hit, .address = 0x80234567, .state = CGECKO_GAME,
+ *                         .instruction = "lwz r3, 0(r4)");
+ *     void on_hit(void) { ... }
+ *
+ * The CGECKO_HOOK line may sit before or after the function (the macro forward-
+ * declares it). Field order is free; any omitted field is zero — i.e.
+ * CGECKO_ALWAYS, no instruction, no flags.
+ */
+
+/* Scene gates. cgecko maps these to Project Rio scene-id compares; a hook runs
+ * only when the game is in the named state. MSSB_ALWAYS runs unconditionally. */
+#define MSSB_ALWAYS 0
+#define MSSB_BOOT   1
+#define MSSB_MENU   2
+#define MSSB_GAME   3
+
+/* Hook flags. */
+#define ASM        (1u << 0)   /* raw inline asm, no save/restore wrapper —
+                                * you manage registers and returns yourself. */
+
+/* Max length of an .instruction string (inline in the record, so cgecko needs
+ * no relocation to read it). PPC mnemonics are short; 64 is ample. */
+#define CGECKO_INSTR_MAX 64
+
+struct CGeckoHook {
+    word   address;                              /* injection site; 0 = per-frame (C0) */
+    word   state;                                /* MSSB_ALWAYS / MSSB_MENU / ...  */
+    word   flags;                                /* ASM | ...                          */
+    char   instruction[CGECKO_INSTR_MAX];        /* asm re-run after the body, or ""   */
+    void (*fn)(void);                            /* the hook body                      */
+};
+
+#define CGECKO_HOOK(fn_, ...)                                                     \
+    void fn_(void);                                                              \
+    static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used)) \
+        _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_), ##__VA_ARGS__ }
+
+/* A per-frame code (Gecko C0): no injection address; the codehandler runs it
+ * once every frame. Same as CGECKO_HOOK with address 0. */
+#define CGECKO_FRAME(fn_, ...) \
+    CGECKO_HOOK(fn_, .address = 0, ##__VA_ARGS__)
+
+/* ── ASM (unwrapped) hooks ───────────────────────────────────────────────────
+ * An ASM hook runs VERBATIM at the injection site — no BACKUP/RESTORE wrapper and
+ * no call, exactly like a hand-written .asm injection. r3–r31 are the game's
+ * LIVE registers, and you manage registers and returns yourself. ASM hooks
+ * cannot use C `static` data (there is no PIC base) — use absolute / claimed
+ * addresses. (`naked` C functions are not an option: PPC GCC ignores `naked`,
+ * so the body is emitted verbatim through top-level asm via ASM_CODE.)
+ *
+ *     ASM_HOOK(bump, .address = 0x80100000, .state = CGECKO_GAME);
+ *     ASM_CODE(bump,
+ *         "addi 3, 3, 1 \n"      // r3 is the game's live r3 here
+ *         "stw  3, 0(4) \n");    // pass the asm as ADJACENT string literals
+ *
+ * A C2 ASM hook runs inline and then falls through to the handler's branch-back,
+ * so end by falling through — no trailing blr. An ASM_FRAME (per-frame C0)
+ * must end in `blr` to return to the codehandler. */
+#define ASM_HOOK(fn_, ...) \
+    void fn_(void); \
+    static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used)) \
+        _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_), .flags = ASM, ##__VA_ARGS__ }
+
+#define ASM_FRAME(fn_, ...) \
+    ASM_HOOK(fn_, .address = 0, ##__VA_ARGS__)
+
+/* Emit an ASM hook's body verbatim (its own .text section, matched by fn name). */
+#define ASM_CODE(fn_, ...) asm( \
+    ".section .text." #fn_ ",\"ax\",@progbits\n" \
+    ".globl " #fn_ "\n" \
+    #fn_ ":\n" \
+    __VA_ARGS__ )
 
 /* ── Memory access ───────────────────────────────────────────────────────── */
 /*
@@ -63,8 +152,8 @@ typedef unsigned int   word;
 /*
  * READ_GAME_REG(type, name, reg_num)
  *   Read the game's GPR value at the injection point. r3–r31 only.
- *   BACKUP saves r3–r31 to the stack but leaves the live registers unchanged,
- *   so the live value equals the saved value. Binds 'name' directly to r<reg_num>.
+ *   BACKUP saves r3–r31 into the hook's stack frame; this binds 'name' to that
+ *   saved slot, reached via r30 (the frame base).
  *
  * WRITE_GAME_REG(reg_num, val)
  *   Write a value to the BACKUP stack slot for a GPR. r3–r31 only.
@@ -80,7 +169,9 @@ typedef unsigned int   word;
  *   WRITE_GAME_REG(3, score + 1);    // game sees r3+1 after gecko code returns
  *   READ_REG(int, raw, 0);           // r0 (scratch, not in BACKUP frame)
  *
- * Note: these macros are only valid in the entry function, not in helper functions.
+ * Note: r30 is the frame base and is preserved across calls, so READ_GAME_REG /
+ *   WRITE_GAME_REG work both in the hook and in any helper it calls. (READ_REG
+ *   for r0–r2 does not — those live registers are only meaningful in the hook.)
  * Note: VSCode may show squiggles on register variable syntax — ignore them.
  */
 #define READ_GAME_REG(type, name, num)                           \
@@ -89,10 +180,9 @@ typedef unsigned int   word;
         _sp + 0x8 + (((num) - 3) << 2)                           \
     )
 
-/* Local register variable reads r1 (backup frame base) without an asm template,
- * avoiding the -mregnames issue entirely. GCC optimizes to a direct stw with
- * r1 as the base register. Do not declare this at file scope — that reserves
- * r1 globally and breaks normal helper functions. */
+/* Writes through r30 (the backup frame base) to the saved-register slot, scoped
+ * in a do/while so repeated writes are fine. RESTORE (lmw r3) loads the slots
+ * back into the real registers before control returns to the game. */
 #define WRITE_GAME_REG(num, val) \
     do { register unsigned int _sp __asm__("r30"); \
          *(volatile unsigned int*)(_sp + 0x8 + (((num) - 3) << 2)) = (unsigned int)(val); \
@@ -116,7 +206,7 @@ typedef unsigned int   word;
  *   Use READ_GAME_REG to read the game's register state at the injection point:
  *     READ_GAME_REG(int, score, 30);   // reads saved r30
  *     WRITE_GAME_REG(30, score + 1);  // game sees r30+1 after gecko code returns
- *   Only valid in the entry function, not in helpers.
+ *   Works in the hook and in helpers it calls (r30 is preserved across calls).
  */
 
  /* ── Float helpers ────────────────────────────────────────────────────────── */

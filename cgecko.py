@@ -46,6 +46,9 @@ GCC_FLAGS = [
     "-O1",
     "-Wno-attributes",
     f"-I{os.path.dirname(SCRIPT_DIR)}",
+    f"-I{SCRIPT_DIR}",   # Common.h ships next to cgecko.py
+    "-include", "Common.h",  # hook macros/helpers are always in scope; an explicit
+                             # #include <Common.h> in the mod is still fine (guarded)
     "-c",
     "-ffixed-r30",   # r30 = saved frame base for macro stack access
     "-ffixed-r31",   # r31 = PIC register (data table base address)
@@ -113,8 +116,6 @@ def parse_gecko_blocks(source: str) -> list[tuple[str, str]]:
 # ==============================================================================
 def _pat(key: str, value_re: str, flags=re.IGNORECASE | re.MULTILINE) -> re.Pattern:
     return re.compile(rf"(?://|#)\s*{key}\s*:\s*{value_re}", flags)
-def _note_pat() -> re.Pattern:
-    return re.compile(r"(?://|#)\s*(\*[^\n]*)", re.MULTILINE)
 ADDRESS_PATTERN     = re.compile(
     r"(?://|#)\s*(?:Address|Inject|Entry)\s*:\s*(0x[0-9A-Fa-f]{8})",
     re.IGNORECASE | re.MULTILINE
@@ -122,32 +123,8 @@ ADDRESS_PATTERN     = re.compile(
 AUTHOR_PATTERN      = _pat("Author",      r"(.+?)(?:\n|$)")
 INSTRUCTION_PATTERN = _pat("Instruction", r"(.+?)(?:\n|$)")
 STATE_PATTERN       = _pat("State",       r"(.+?)(?:\n|$)")
-NOTE_PATTERN        = _note_pat()
-def make_func_pattern(func_name: str) -> re.Pattern:
-    return re.compile(
-        r"^([^\S\n]*)"
-        r"(?:__attribute__\s*\(\s*\(\s*naked\s*\)\s*\)\s*)?"
-        r"((?:unsigned\s+)?(?:int|void|float|double|void\s*\*))"
-        rf"\s+{re.escape(func_name)}\s*\(([^)]*)\)",
-        re.MULTILINE
-    )
-def parse_address(source: str) -> int:
-    matches = ADDRESS_PATTERN.findall(source)
-    if not matches:
-        die("No 'Address: 0x80XXXXXX' comment found in source file.")
-    if len(matches) > 1:
-        die(f"Multiple Address comments found: {matches}. Only one is allowed.")
-    addr = int(matches[0], 16)
-    if addr % 4 != 0:
-        die(f"Address {hex(addr)} is not 4-byte aligned.")
-    if not (0x80000000 <= addr <= 0x81FFFFFF):
-        warn(f"Address {hex(addr)} is outside typical GameCube RAM (0x80000000-0x81FFFFFF).")
-    return addr
 def parse_author(source: str) -> str | None:
     m = AUTHOR_PATTERN.search(source)
-    return m.group(1).strip() if m else None
-def parse_instruction(source: str) -> str | None:
-    m = INSTRUCTION_PATTERN.search(source)
     return m.group(1).strip() if m else None
 # State values map to Project Rio scene IDs
 STATE_MAP = {
@@ -180,24 +157,6 @@ def parse_notes(source: str, is_asm: bool = False) -> list[str]:
     marker  = r"#" if is_asm else r"//"
     pattern = re.compile(rf"(?:{marker})\s*(\*[^\n]*)", re.MULTILINE)
     return [m.group(1).strip() for m in pattern.finditer(source)]
-# Matches the first non-static function signature in a source slice.
-# Does not include 'static' in the alternation, so static helpers are skipped.
-_FUNC_DEF_PATTERN = re.compile(
-    r"^[^\S\n]*"
-    r"(?:__attribute__\s*\(\s*\(\s*naked\s*\)\s*\)\s*)?"
-    r"(?:unsigned\s+)?(?:int|void|float|double|void\s*\*)"
-    r"\s+(\w+)\s*\([^)]*\)",
-    re.MULTILINE
-)
-def find_entry_func(source: str) -> str:
-    """Return the name of the first non-static function definition in source.
-    Skips declarations (ending in ';') and only returns the name when the
-    signature is immediately followed by '{', making it a definition.
-    """
-    for m in _FUNC_DEF_PATTERN.finditer(source):
-        if source[m.end():].lstrip().startswith("{"):
-            return m.group(1)
-    die("Could not find any function definition in source.")
 # ==============================================================================
 # INSTRUCTION ASSEMBLY
 # ==============================================================================
@@ -226,123 +185,33 @@ def assemble_instruction(asm_text: str, tmpdir: str) -> int:
         die(f"Instruction '{asm_text}' assembled to {len(data)} bytes (expected 4).")
     return struct.unpack(">I", data[:4])[0]
 # ==============================================================================
-# MULTI-SECTION
+# ASM SECTION BUILDER
 # ==============================================================================
-def split_asm_sections(source: str) -> list[dict]:
-    """Split a multi-injection ASM file into per-section dicts.
-    Each section begins at an '// Address:' comment and runs to the next one.
-    Per-section // Instruction: is parsed from that section's slice only, so
-    each injection site can independently override the appended instruction.
-    """
-    matches = list(ADDRESS_PATTERN.finditer(source))
-    sections = []
-    for i, m in enumerate(matches):
-        start = m.start()
-        end   = matches[i + 1].start() if i + 1 < len(matches) else len(source)
-        text  = source[start:end]
-        addr = int(m.group(1), 16)
-        if addr % 4 != 0:
-            die(f"Address {hex(addr)} is not 4-byte aligned.")
-        if not (0x80000000 <= addr <= 0x81FFFFFF):
-            warn(f"Address {hex(addr)} is outside typical GameCube RAM.")
-        instr_m = INSTRUCTION_PATTERN.search(text)
-        if instr_m:
-            die(f"// Instruction: is not supported in ASM files "
-                f"(section at {addr:#010x}). Use it only in .c files.")
-        sections.append({
-            "address":     addr,
-            "instruction": None,
-            "source":      text,
-        })
-    return sections
 def _build_asm_section(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
-    """Assemble one section of a multi-injection ASM file into gecko code lines."""
-    addr       = section["address"]
-    instr_text = section["instruction"]
-    src_text   = section["source"]
+    """Assemble one # Address: section of an ASM file into gecko code lines.
+    The user's ASM is used VERBATIM — no blr rewriting. A C2 runs inline and
+    falls through to the handler's appended branch-back, so author your ASM to
+    end by falling through (do not put a trailing blr unless you mean to return
+    through the game's link register)."""
+    addr     = section["address"]
+    src_text = section["source"]
     tag      = f"sec{idx}_{addr:08x}"
     src_path = os.path.join(tmpdir, f"{tag}.s")
     obj_path = os.path.join(tmpdir, f"{tag}.o")
     with open(src_path, "w") as f:
         f.write(src_text)
     assemble_asm(src_path, obj_path, debug)
-    appended_instr: int | None = None
-    if instr_text:
-        appended_instr = assemble_instruction(instr_text, tmpdir)
-        print(f"[INFO]   Instruction hex : {appended_instr:#010x}")
     payload = extract_section(obj_path, ".text")
     if not payload:
         die(f"Section {idx + 1} at {addr:#010x} produced no .text output.")
-    payload = replace_blr(payload, 0, debug)
-    if len(payload) == 4 and appended_instr is None:
+    if len(payload) == 4:
         instr_word = struct.unpack(">I", payload)[0]
         lines = format_04(addr, instr_word)
         print(f"[INFO]   {addr:#010x} → 04 write")
     else:
-        payload = pad_and_terminate(payload, appended_instr, debug)
+        payload = pad_and_terminate(payload, None, debug)
         lines   = format_c2(addr, payload)
         print(f"[INFO]   {addr:#010x} → C2  ({len(payload) // 4} words)")
-    return lines
-# ── C ──────────────────────────────────────────────────────────────────────────
-def split_c_sections(source: str) -> list[dict]:
-    """Split a multi-injection C file into per-section dicts.
-    Everything before the first Address/Inject/Entry comment is the preamble
-    (shared includes, defines, static helpers) and is prepended to every
-    section's source before compilation, so each section compiles independently.
-    Each section's entry function is the first non-static function defined
-    after its Address/Inject/Entry comment.
-    """
-    matches  = list(ADDRESS_PATTERN.finditer(source))
-    preamble = source[:matches[0].start()]
-    sections = []
-    for i, m in enumerate(matches):
-        start        = m.start()
-        end          = matches[i + 1].start() if i + 1 < len(matches) else len(source)
-        section_text = source[start:end]
-        addr = int(m.group(1), 16)
-        if addr % 4 != 0:
-            die(f"Address {hex(addr)} is not 4-byte aligned.")
-        if not (0x80000000 <= addr <= 0x81FFFFFF):
-            warn(f"Address {hex(addr)} is outside typical GameCube RAM.")
-        instr_m = INSTRUCTION_PATTERN.search(section_text)
-        sections.append({
-            "address":      addr,
-            "instruction":  instr_m.group(1).strip() if instr_m else None,
-            "source":       preamble + section_text,  # full source passed to compile_c
-            "section_text": section_text,             # slice used for entry func detection
-        })
-    return sections
-def _build_c_section(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
-    """Compile one section of a multi-injection C file into gecko code lines."""
-    addr       = section["address"]
-    instr_text = section["instruction"]
-    func_name  = find_entry_func(section["section_text"])
-    tag      = f"sec{idx}_{addr:08x}"
-    src_path = os.path.join(tmpdir, f"{tag}.c")
-    obj_path = os.path.join(tmpdir, f"{tag}.o")
-    elf_path = os.path.join(tmpdir, f"{tag}.elf")
-    ld_path  = os.path.join(tmpdir, f"{tag}.ld")
-    print(f"[INFO]   Entry function : {func_name}()")
-    rewritten = prepare_source(section["source"], func_name)
-    if debug:
-        print(f"[DEBUG] Section {idx + 1} rewritten source:\n" + rewritten)
-    with open(src_path, "w") as f:
-        f.write(rewritten)
-    compile_c(src_path, obj_path, debug)
-    with open(ld_path, "w") as f:
-        f.write(make_linker_script(func_name))
-    link_elf(obj_path, elf_path, ld_path, debug, entry=func_name)
-    disasm = disassemble(elf_path)
-    if debug:
-        print(f"[DEBUG] Section {idx + 1} disassembly:\n" + disasm)
-    appended_instr: int | None = None
-    if instr_text:
-        appended_instr = assemble_instruction(instr_text, tmpdir)
-        print(f"[INFO]   Instruction hex : {appended_instr:#010x}")
-    payload = build_payload(elf_path, False, set(), debug, entry=func_name)
-    payload = pad_and_terminate(payload, appended_instr, debug)
-    lines   = format_c2(addr, payload)
-    print(f"[INFO]   {addr:#010x} → C2  ({len(payload) // 4} words)")
     return lines
 CONFIG_PATH = os.path.join(os.path.dirname(SCRIPT_DIR), "config.json")
 TXT_PATH    = os.path.join(os.path.dirname(SCRIPT_DIR), "codes.txt")
@@ -431,21 +300,28 @@ def make_linker_script(func_name: str) -> str:
     """Place .picdata (.rodata/.data) at address 0 so GCC emits 'lis rN, 0'
     for all static data references — those instructions are then patched to
     'mr rN, r31' at payload-build time."""
+    # .bss/.sbss/COMMON are folded INTO the loaded .picdata (not a NOLOAD section)
+    # so uninitialized/zero statics get real, zero-filled backing at an r31-relative
+    # address and persist for the life of the code — just like initialized statics.
     return (
         "SECTIONS {\n"
         "    . = 0x00000000;\n"
         "    .picdata : {\n"
         "        *(.rodata*)\n"
         "        *(.data*)\n"
+        "        *(.sdata*)\n"
+        "        *(.sdata2*)\n"
+        "        *(.sbss*)\n"
+        "        *(.bss*)\n"
+        "        *(COMMON)\n"
         "    }\n"
         "    . = ALIGN(4);\n"
         "    .text : {\n"
         f"        *(.text.{func_name})\n"
         "        *(.text*)\n"
         "    }\n"
-        "    .bss (NOLOAD) : { *(.bss*) *(.sbss*) }\n"
         "    /DISCARD/ : {\n"
-        "        *(.comment) *(.gnu.attributes)\n"
+        "        *(.cgecko_hooks) *(.comment) *(.gnu.attributes)\n"
         "        *(.eh_frame*) *(.pdr)\n"
         "    }\n"
         "}\n"
@@ -494,6 +370,18 @@ def link_elf(obj_path: str, elf_path: str, ld_path: str, debug: bool, entry: str
 # ==============================================================================
 # SECTION EXTRACTION
 # ==============================================================================
+def elf_section_size(elf_path: str, name: str) -> int:
+    """Memory size (bytes) of a section, from readelf -S. This is the full extent
+    INCLUDING any zero-filled .bss tail folded into the section — objcopy's binary
+    output can omit that tail, so callers pad up to this size."""
+    out = subprocess.run([READELF, "-SW", elf_path],
+                         capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        m = re.search(re.escape(name) + r"\s+\w+\s+[0-9A-Fa-f]+\s+[0-9A-Fa-f]+\s+([0-9A-Fa-f]+)",
+                      line)
+        if m:
+            return int(m.group(1), 16)
+    return 0
 def extract_section(obj_path: str, section: str) -> bytes:
     tmp = obj_path + ".sec.tmp"
     try:
@@ -574,163 +462,6 @@ def build_restore(frame_size: int, used_fprs: set[int]) -> bytes:
     ]
     return _pack(*instrs)
 # ==============================================================================
-# PIC STUB
-# ==============================================================================
-PIC_STUB_INSTRS = [MFLR_R0, 0x48000005, 0x7D6802A6, MTLR_R0]
-def pic_stub_bytes() -> bytes:
-    return _pack(*PIC_STUB_INSTRS)
-# ==============================================================================
-# BLR REPLACEMENT
-# ==============================================================================
-def get_entry_extent(elf_path: str, entry: str) -> int | None:
-    """Return the byte extent of the entry function within .text (its offset
-    from the start of .text plus its size), or None if it can't be determined.
-    Used to limit blr rewriting to the entry function: a helper function's blr
-    is a genuine return to its caller and must NOT be routed to RESTORE."""
-    try:
-        sec = subprocess.run([READELF, "-SW", elf_path],
-                             capture_output=True, text=True).stdout
-        text_addr = None
-        for line in sec.splitlines():
-            m = re.search(r"\.text\s+\S+\s+([0-9A-Fa-f]+)", line)
-            if m:
-                text_addr = int(m.group(1), 16)
-                break
-        if text_addr is None:
-            return None
-        syms = subprocess.run([READELF, "-sW", elf_path],
-                              capture_output=True, text=True).stdout
-        for line in syms.splitlines():
-            parts = line.split()
-            if len(parts) >= 8 and parts[3] == "FUNC" and parts[7] == entry:
-                value = int(parts[1], 16)
-                size  = int(parts[2], 0)
-                if size == 0:
-                    return None
-                return (value - text_addr) + size
-    except Exception:
-        pass
-    return None
-def replace_blr(text: bytes, data_after: int, debug: bool,
-                entry_extent: int | None = None) -> bytes:
-    """Route returns to RESTORE. When entry_extent is given (C builds), only
-    returns inside [0, entry_extent) — the entry function, which the linker
-    script places first in .text — are rewritten; helper functions keep their
-    blr so they return to their caller. When None (ASM builds), every blr is
-    treated as a return to the game, preserving historical behavior."""
-    text_len = len(text)
-    words    = list(struct.unpack(f">{text_len // 4}I", text))
-
-    def is_return_to_lr(w: int) -> bool:
-        # bclrx: primary opcode 19, extended opcode 16, LK=0. This matches blr and
-        # every conditional return (beqlr, bnelr, bltlr, ...). It deliberately does
-        # NOT match bcctr/bctr (ext op 528) -- those are FUNCTION_ADDRESS calls -- or
-        # blrl (LK=1, a call through LR).
-        return (w >> 26) == 19 and ((w >> 1) & 0x3FF) == 16 and (w & 1) == 0
-
-    def is_unconditional(bo: int) -> bool:
-        return (bo & 0b10100) == 0b10100   # BO = 1z1zz -> branch always
-
-    # Only a trailing UNCONDITIONAL blr can be dropped to fall through to RESTORE,
-    # and only when nothing (PIC data) sits between text and RESTORE. When helper
-    # functions follow the entry, the trailing blr belongs to a helper — keep it.
-    drop_tail     = (bool(words) and words[-1] == BLR_INSTR and data_after == 0
-                     and (entry_extent is None or entry_extent >= text_len))
-    effective_len = text_len - (4 if drop_tail else 0)
-
-    uncond = cond = 0
-    for i, word in enumerate(words):
-        if not is_return_to_lr(word):
-            continue
-        instr_offset = i * 4
-        if entry_extent is not None and instr_offset >= entry_extent:
-            continue  # helper function's return — a real blr to its caller
-        delta = (effective_len - instr_offset) + data_after
-        bo = (word >> 21) & 0x1F
-        bi = (word >> 16) & 0x1F
-        if is_unconditional(bo):
-            uncond += 1
-            if drop_tail and i == len(words) - 1:
-                continue  # popped below; falls through to RESTORE naturally
-            words[i] = B_BASE | (delta & 0x03FFFFFC)
-            if debug:
-                print(f"[DEBUG] blr at .text+{instr_offset:#05x} -> b +{delta} (skips {data_after} data bytes)")
-        else:
-            cond += 1
-            # Rewrite the conditional return as a bc with the SAME BO/BI, branching
-            # forward to RESTORE so the early-exit path still runs the epilogue.
-            if not (0 <= delta <= 0x7FFC):
-                die(f"conditional return at .text+{instr_offset:#x} is {delta} bytes from "
-                    f"RESTORE — too far to encode as a bc (max 0x7FFC). Simplify the code "
-                    f"or split it across sections.")
-            words[i] = (16 << 26) | (bo << 21) | (bi << 16) | (delta & 0x0000FFFC)
-            if debug:
-                print(f"[DEBUG] conditional return (BO={bo}, BI={bi}) at .text+{instr_offset:#05x} "
-                      f"-> bc +{delta} to RESTORE")
-    if drop_tail:
-        words.pop()
-        uncond -= 1  # the dropped blr is not a replacement
-        if debug:
-            print(f"[DEBUG] trailing blr at .text+{effective_len:#05x} — dropped (falls through to RESTORE)")
-    total = uncond + cond
-    if total:
-        print(f"[INFO] Routed {total} return(s) to RESTORE "
-              f"({cond} conditional, {uncond} unconditional branch(es)).")
-    return struct.pack(f">{len(words)}I", *words)
-# ==============================================================================
-# SOURCE REWRITING  (C only)
-# ==============================================================================
-def prepare_source(source: str, func_name: str, naked: bool = True) -> str:
-    """
-    Move the entry function to the top of the source (after preprocessor lines)
-    so GCC places it first in its section. Add forward declarations for helpers.
-    """
-    pattern = make_func_pattern(func_name)
-    m       = pattern.search(source)
-    if not m:
-        die(f"Could not find '{func_name}()' function definition in the source file.")
-    brace_start = source.find("{", m.end())
-    if brace_start == -1:
-        die("Could not find opening brace of entry function.")
-    depth, brace_end = 0, brace_start
-    for i, ch in enumerate(source[brace_start:], brace_start):
-        if ch == "{":   depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                brace_end = i
-                break
-    else:
-        die("Could not find closing brace of entry function.")
-    ret_type  = m.group(2).strip()
-    args      = m.group(3)
-    body      = source[brace_start : brace_end + 1]
-    if naked:
-        func_text = (f"{m.group(1)}__attribute__((naked)) "
-                     f"{ret_type} {func_name}({args}) {body}")
-    else:
-        func_text = f"{m.group(1)}{ret_type} {func_name}({args}) {body}"
-    source_without = source[:m.start()] + source[brace_end + 1:]
-    # Insertion point: where the entry function was in the original source.
-    # Everything before it (includes, defines, static vars) stays in place.
-    insert_pos = m.start()
-    # Forward declare all helper functions so the entry function can call them
-    fwd_decls = ""
-    for fm in re.finditer(
-        r'((?:unsigned\s+)?(?:int|void|float|double|void\s*\*))\s+(\w+)\s*\(([^)]*)\)\s*\{',
-        source_without[insert_pos:]
-    ):
-        fwd_ret  = fm.group(1).strip()
-        fwd_name = fm.group(2)
-        fwd_args = fm.group(3)
-        if fwd_name != func_name:
-            fwd_decls += f"static {fwd_ret} {fwd_name}({fwd_args});\n"
-    rewritten = (source_without[:insert_pos]
-                 + fwd_decls
-                 + "\n" + func_text + "\n\n"
-                 + source_without[insert_pos:])
-    return rewritten
-# ==============================================================================
 # PAYLOAD ASSEMBLY
 # ==============================================================================
 # Opcodes where bits 25-21 encode a destination GPR that is written.
@@ -779,66 +510,6 @@ def patch_lis_for_pic(text: bytes) -> bytes:
     if to_remove:
         print(f"[INFO] PIC: nop'd {len(to_remove)} 'lis rN, 0', base uses → r31")
     return struct.pack(f">{len(words)}I", *words)
-def build_payload(elf_path: str,
-                  raw_mode: bool,
-                  extra_fprs: set[int],
-                  debug: bool,
-                  entry: str | None = None) -> bytes:
-    """Assemble the final C2 payload bytes.
-    PIC layout when .picdata is non-empty:
-        BACKUP
-        bl +(4 + len(picdata))   ← LR = &picdata[0]; jumps to mflr r31
-        [picdata]                ← .rodata/.data bytes, padded to 4B
-        mflr r31                 ← r31 = LR = &picdata[0]
-        [.text, lis rN,0 removed; base uses → r31]
-        RESTORE
-    """
-    text    = extract_section(elf_path, ".text")
-    picdata = extract_section(elf_path, ".picdata")
-    if not text:
-        die("No .text section in compiled output. Is the source file empty?")
-    # Pad picdata to 4-byte boundary so mflr r31 is 4-byte aligned
-    if picdata:
-        pad     = b"\x00" * ((-len(picdata)) % 4)
-        picdata = picdata + pad
-    if debug:
-        print(f"[DEBUG] .text    : {len(text)//4} instructions ({len(text)} bytes)")
-        print(f"[DEBUG] .picdata : {len(picdata)} bytes")
-    if raw_mode:
-        return replace_blr(text, 0, debug)
-    entry_extent = get_entry_extent(elf_path, entry) if entry else None
-    if entry and entry_extent is None:
-        warn(f"Could not measure entry '{entry}' in the ELF — routing EVERY blr "
-             f"to RESTORE. Helper function returns will be broken; inline them.")
-    elif entry_extent is not None and debug:
-        print(f"[DEBUG] Entry extent: {entry_extent:#x} bytes "
-              f"(blrs past this stay as helper returns)")
-    # Patch lis rN,0 → nop + base propagation before blr replacement
-    if picdata:
-        text = patch_lis_for_pic(text)
-    text = replace_blr(text, 0, debug, entry_extent)
-    used_fprs  = detect_used_fprs(text, extra_fprs, debug)
-    frame_size = compute_frame_size(used_fprs)
-    backup     = build_backup(frame_size, used_fprs)
-    restore    = build_restore(frame_size, used_fprs)
-    if debug:
-        fpu_desc = ("GPR only" if not used_fprs else
-                    f"GPR+FPU {', '.join(f'f{n}' for n in sorted(used_fprs))}")
-        print(f"[DEBUG] Frame : {frame_size:#x} ({fpu_desc})")
-    if picdata:
-        # bl delta: from bl instruction to mflr r31 (just past picdata)
-        # bl at P → LR = P+4 = &picdata[0]; PC = P + bl_delta = &mflr r31
-        bl_delta = 4 + len(picdata)
-        bl_instr = struct.pack(">I", BL_BASE | (bl_delta & 0x03FFFFFC))
-        mflr_r31 = struct.pack(">I", MFLR_R31)
-        payload  = backup + bl_instr + picdata + mflr_r31 + text + restore
-        if debug:
-            print(f"[DEBUG] PIC bl delta: {bl_delta} ({len(picdata)}B data + 4B mflr)")
-    else:
-        payload = backup + text + restore
-    if len(payload) % 4 != 0:
-        die(f"Payload size {len(payload)} is not 4-byte aligned.")
-    return payload
 def pad_and_terminate(payload: bytes,
                        appended_instr: int | None,
                        debug: bool) -> bytes:
@@ -1015,86 +686,6 @@ def finalize_c0_asm(text: bytes) -> bytes:
     return struct.pack(f">{len(words)}I", *words)
 
 
-def build_c0_payload(elf_path: str, debug: bool) -> bytes:
-    """Build a C0 payload from compiled C.
-
-    No BACKUP/RESTORE wrapper: the codehandler already saves/restores the whole
-    game context around the entire code list, and a non-naked compile lets GCC
-    set up its own frame/LR only when the body calls something. blrs are left
-    intact (replace_blr is NOT run).
-
-    PIC carve-out: when .picdata exists, the injected 'bl' that loads r31 would
-    clobber LR (the handler's return address). Bracket it with mflr r0 / mtlr r0
-    so the handler return survives into the function's own prologue:
-
-        mflr r0                ; r0 = handler return address
-        bl   +(4 + len(data))  ; LR = &picdata; branch past data to mflr r31
-        [picdata]
-        mflr r31               ; r31 = &picdata  (PIC base)
-        mtlr r0                ; LR = handler return (restored)
-        [.text]                ; leaf  -> blr returns to handler
-                               ; caller -> prologue's mflr reads the correct LR
-    """
-    text    = extract_section(elf_path, ".text")
-    picdata = extract_section(elf_path, ".picdata")
-    if not text:
-        die("No .text in compiled C0 output. Is the C0 function empty?")
-    if picdata:
-        picdata = picdata + b"\x00" * ((-len(picdata)) % 4)   # 4-byte align
-        text    = patch_lis_for_pic(text)
-        bl_delta = 4 + len(picdata)
-        stub = (struct.pack(">I", MFLR_R0)
-                + struct.pack(">I", BL_BASE | (bl_delta & 0x03FFFFFC))
-                + picdata
-                + struct.pack(">I", MFLR_R31)
-                + struct.pack(">I", MTLR_R0))
-        payload = stub + text
-        if debug:
-            print(f"[DEBUG] C0 PIC: mflr r0 / bl +{bl_delta} / "
-                  f"[{len(picdata)}B data] / mflr r31 / mtlr r0")
-    else:
-        payload = text
-    if len(payload) % 4 != 0:
-        die(f"C0 payload size {len(payload)} is not 4-byte aligned.")
-    return payload
-
-
-def _build_c0_c(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
-    """Compile the leading-region C function into a C0 code.
-
-    Built like a C2 (naked body + BACKUP/RESTORE wrapper via build_payload) so
-    the codehandler's working registers (r3-r31) survive the body. A function
-    call clobbers every volatile register, and the codehandler keeps codelist
-    state in some of them, so without the wrapper the handler dies after the C0
-    returns. The only difference from a C2 is the tail: instead of a handler-
-    overwritten terminator branching back to an inject site, the C0 ends in a
-    real blr to return to the codehandler."""
-    func_name = section["entry"]
-    tag      = f"c0_{idx}"
-    src_path = os.path.join(tmpdir, f"{tag}.c")
-    obj_path = os.path.join(tmpdir, f"{tag}.o")
-    elf_path = os.path.join(tmpdir, f"{tag}.elf")
-    ld_path  = os.path.join(tmpdir, f"{tag}.ld")
-    print(f"[INFO]   C0 entry func  : {func_name}()")
-    rewritten = prepare_source(section["source"], func_name)   # naked; wrapper supplies the frame
-    if debug:
-        print(f"[DEBUG] C0 rewritten source:\n" + rewritten)
-    with open(src_path, "w") as f:
-        f.write(rewritten)
-    compile_c(src_path, obj_path, debug)
-    with open(ld_path, "w") as f:
-        f.write(make_linker_script(func_name))
-    link_elf(obj_path, elf_path, ld_path, debug, entry=func_name)
-    if debug:
-        print(f"[DEBUG] C0 disassembly:\n" + disassemble(elf_path))
-    payload = build_payload(elf_path, False, set(), debug, entry=func_name)  # BACKUP + body(blr->RESTORE) + RESTORE
-    payload = payload + struct.pack(">I", BLR_INSTR)           # return to the codehandler
-    payload = terminate_c0(payload)                            # pad to a whole 8-byte line
-    lines   = format_c0(payload)
-    print(f"[INFO]   C0 -> {len(payload) // 8} line(s)")
-    return lines
-
-
 def _build_c0_asm(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str]:
     """Assemble the leading-region ASM into a C0 code. Returns [] if the region
     held only directives/comments (no emitted instructions)."""
@@ -1117,10 +708,11 @@ def _build_c0_asm(section: dict, idx: int, tmpdir: str, debug: bool) -> list[str
 
 def _build_section(section: dict, idx: int, tmpdir: str,
                    is_asm: bool, debug: bool) -> list[str]:
-    """Dispatch a parsed section to the correct builder by type and language."""
+    """Dispatch a parsed ASM section to the correct builder by type. (C files go
+    through generate_c_codes / .cgecko_hooks; this path is ASM-only.)"""
     if section["type"] == "c0":
-        return (_build_c0_asm if is_asm else _build_c0_c)(section, idx, tmpdir, debug)
-    return (_build_asm_section if is_asm else _build_c_section)(section, idx, tmpdir, debug)
+        return _build_c0_asm(section, idx, tmpdir, debug)
+    return _build_asm_section(section, idx, tmpdir, debug)
 
 
 def _asm_has_content(text: str) -> bool:
@@ -1131,59 +723,12 @@ def _asm_has_content(text: str) -> bool:
     return False
 
 
-def _leading_c_entry(leading: str) -> str | None:
-    """First non-static function *definition* in the leading region, or None.
-    (_FUNC_DEF_PATTERN doesn't match 'static' functions, so correctly-static
-    helpers are skipped — only a non-static function is taken as the C0 entry.)"""
-    for m in _FUNC_DEF_PATTERN.finditer(leading):
-        if leading[m.end():].lstrip().startswith("{"):
-            return m.group(1)
-    return None
+def split_codes(source: str, is_asm: bool = True) -> list[dict]:
+    """Split an ASM source file into tagged sections in source order.
 
-
-def _warn_sloppy_helpers(leading: str, entry: str) -> None:
-    """Warn for any non-static function beyond the entry in the C0 region —
-    helpers should be 'static' so the C0 entry stays unambiguous."""
-    for m in _FUNC_DEF_PATTERN.finditer(leading):
-        name = m.group(1)
-        if name != entry and leading[m.end():].lstrip().startswith("{"):
-            warn(f"'{name}()' in the C0 region is not declared 'static'. "
-                 f"'{entry}()' is taken as the C0 entry; mark helpers 'static' "
-                 f"(a non-static helper can be mis-detected as the entry).")
-
-
-def _excise_function(text: str, func_name: str) -> tuple[str, str]:
-    """Return (function_definition, text_with_that_definition_removed), via
-    brace matching. Pulls the C0 entry out of the shared C2 preamble."""
-    m = make_func_pattern(func_name).search(text)
-    if not m:
-        die(f"Could not locate '{func_name}()' to excise from the C0 region.")
-    brace_start = text.find("{", m.end())
-    if brace_start == -1:
-        die(f"Could not find opening brace of '{func_name}()'.")
-    depth, brace_end = 0, brace_start
-    for i, ch in enumerate(text[brace_start:], brace_start):
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                brace_end = i
-                break
-    else:
-        die(f"Could not find closing brace of '{func_name}()'.")
-    return text[m.start():brace_end + 1], text[:m.start()] + text[brace_end + 1:]
-
-
-def split_codes(source: str, is_asm: bool) -> list[dict]:
-    """Split a source file into tagged sections in source order.
-
-    Leading region (before the first // Address:) -> a C0 section: for C when it
-    holds a non-static function, for ASM when it holds emitted instructions.
-    Each // Address: -> next-// Address: slice -> a C2 section.
-
-    Legacy files with no leading function/code yield only C2 sections, exactly
-    as before — that's the backward-compat path, not a separate branch.
+    Leading region (before the first # Address:) -> a C0 section when it holds
+    emitted instructions. Each # Address: -> next-# Address: slice -> a C2 section.
+    (C files no longer use this path — their sections come from .cgecko_hooks.)
     """
     matches = list(ADDRESS_PATTERN.finditer(source))
     leading = source[:matches[0].start()] if matches else source
@@ -1191,28 +736,11 @@ def split_codes(source: str, is_asm: bool) -> list[dict]:
     sections: list[dict] = []
 
     # ---- C0 (leading region) ----
-    if is_asm:
-        if INSTRUCTION_PATTERN.search(leading):
-            warn("// Instruction: is ignored in ASM files.")
-        if _asm_has_content(leading):
-            sections.append({"type": "c0", "address": None,
-                             "instruction": None, "source": leading})
-        preamble = ""   # ASM: leading region is not shared into C2 sections
-    else:
-        if INSTRUCTION_PATTERN.search(leading):
-            warn("// Instruction: before the first // Address: is ignored "
-                 "(it is only honored inside a C2 section of a C file).")
-        entry = _leading_c_entry(leading)
-        if entry:
-            _warn_sloppy_helpers(leading, entry)
-            # Excise the C0 entry so it isn't compiled into every C2 unit /
-            # forward-declared static against its non-static definition.
-            _, preamble = _excise_function(leading, entry)
-            sections.append({"type": "c0", "address": None,
-                             "instruction": None, "source": leading,
-                             "entry": entry})
-        else:
-            preamble = leading   # legacy: shared includes/defines/static helpers
+    if INSTRUCTION_PATTERN.search(leading):
+        warn("# Instruction: is ignored in ASM files.")
+    if _asm_has_content(leading):
+        sections.append({"type": "c0", "address": None,
+                         "instruction": None, "source": leading})
 
     # ---- C2 (Address slices) ----
     for i, m in enumerate(matches):
@@ -1230,28 +758,242 @@ def split_codes(source: str, is_asm: bool) -> list[dict]:
         # code can mix e.g. a menu-rel hook with game-rel hooks.
         sec_state = parse_state(section_text)
 
-        instr_m = INSTRUCTION_PATTERN.search(section_text)
-        if is_asm:
-            if instr_m:
-                warn(f"// Instruction: is ignored in ASM files "
-                     f"(section at {addr:#010x}).")
-            sections.append({"type": "c2", "address": addr,
-                             "instruction": None, "source": section_text,
-                             "state": sec_state})
-        else:
-            sections.append({"type": "c2", "address": addr,
-                             "instruction": instr_m.group(1).strip() if instr_m else None,
-                             "source": preamble + section_text,
-                             "section_text": section_text,
-                             "state": sec_state})
+        if INSTRUCTION_PATTERN.search(section_text):
+            warn(f"# Instruction: is ignored in ASM files "
+                 f"(section at {addr:#010x}).")
+        sections.append({"type": "c2", "address": addr,
+                         "instruction": None, "source": section_text,
+                         "state": sec_state})
 
     return sections
 
 
 # ==============================================================================
+# C HOOK METADATA  (.cgecko_hooks records emitted by Common.h)
+# ==============================================================================
+ASM_FLAG           = 0x1
+CGECKO_INSTR_MAX   = 64
+# struct CGeckoHook: u32 address, u32 state, u32 flags, char[64] instruction, ptr fn
+CGECKO_RECORD_SIZE = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4
+CGECKO_FN_OFFSET   = 4 + 4 + 4 + CGECKO_INSTR_MAX
+# Common.h CGECKO_* state tags -> Project Rio scene-id conditional (addr, value).
+CGECKO_STATE_MAP = {
+    1: (0x280E877C, 0x00000000),   # CGECKO_BOOT
+    2: (0x280E877C, 0x00000004),   # CGECKO_MENU
+    3: (0x280E877C, 0x00000005),   # CGECKO_GAME
+}
+def parse_relocs(obj_path: str, section: str) -> dict[int, str]:
+    """Map relocation offset -> target symbol name for one section, read from the
+    object's .rela<section>. Used to resolve each CGeckoHook.fn pointer to its entry
+    function name (the rest of the record is plain integers / inline chars)."""
+    out: dict[int, str] = {}
+    txt = subprocess.run([READELF, "-r", obj_path],
+                         capture_output=True, text=True).stdout
+    want, in_block = f"'.rela{section}'", False
+    for line in txt.splitlines():
+        s = line.strip()
+        if s.startswith("Relocation section"):
+            in_block = want in s
+            continue
+        if not in_block or not s or s.startswith("Offset"):
+            continue
+        parts = s.split()
+        try:
+            off = int(parts[0], 16)
+        except (ValueError, IndexError):
+            continue
+        if len(parts) >= 5:
+            out[off] = parts[4]
+    return out
+def read_hook_records(obj_path: str) -> list[dict]:
+    """Parse CGeckoHook records out of the compiled object's .cgecko_hooks section.
+    Returns [] when the section is absent (no Common.h hooks declared)."""
+    data = extract_section(obj_path, ".cgecko_hooks")
+    if not data:
+        return []
+    if len(data) % CGECKO_RECORD_SIZE != 0:
+        die(f".cgecko_hooks is {len(data)} bytes, not a multiple of "
+            f"{CGECKO_RECORD_SIZE} — struct CGeckoHook is out of sync with Common.h.")
+    relocs = parse_relocs(obj_path, ".cgecko_hooks")
+    hooks: list[dict] = []
+    for i in range(len(data) // CGECKO_RECORD_SIZE):
+        base    = i * CGECKO_RECORD_SIZE
+        address = struct.unpack_from(">I", data, base)[0]
+        state   = struct.unpack_from(">I", data, base + 4)[0]
+        flags   = struct.unpack_from(">I", data, base + 8)[0]
+        instr   = data[base + 12:base + 12 + CGECKO_INSTR_MAX] \
+                      .split(b"\x00", 1)[0].decode("ascii", "replace")
+        entry   = relocs.get(base + CGECKO_FN_OFFSET)
+        if not entry:
+            die(f"CGeckoHook #{i}: no fn relocation. A hook's function must be a "
+                f"defined, non-static 'void name(void)'.")
+        if address:
+            if address % 4:
+                die(f"Hook '{entry}': address {address:#x} is not 4-byte aligned.")
+            if not (0x80000000 <= address <= 0x81FFFFFF):
+                warn(f"Hook '{entry}': address {address:#x} outside typical GC RAM.")
+        if state and state not in CGECKO_STATE_MAP:
+            die(f"Hook '{entry}': unknown state tag {state}. "
+                f"Use CGECKO_ALWAYS / CGECKO_BOOT / CGECKO_MENU / CGECKO_GAME.")
+        hooks.append({"address": address, "state": state, "flags": flags,
+                      "instruction": instr or None, "entry": entry})
+    return hooks
+def strip_section(obj_in: str, obj_out: str, section: str):
+    """Copy an object with one section (and its relocations) removed, so build-
+    time metadata is gone before per-hook --gc-sections linking."""
+    subprocess.run([OBJCOPY, "--remove-section", section,
+                    "--remove-section", ".rela" + section, obj_in, obj_out],
+                   capture_output=True)
+    if not os.path.isfile(obj_out):
+        shutil.copyfile(obj_in, obj_out)
+def build_call_payload(elf_path: str, entry: str, is_c0: bool,
+                       appended_instr: int | None, flags: int, debug: bool) -> bytes:
+    """Assemble the call-model payload for one C hook.
+
+        BACKUP                                 ; save game regs; r30 = frame base
+        [ bl +picdata ; picdata ; mflr r31 ]   ; PIC base, when static data exists
+        bl   entry                             ; call the hook (LR -> RESTORE)
+        RESTORE                                ; restore game regs / LR
+        b tail   (C2)   |   blr   (C0)         ; return to game / to codehandler
+        entry: [.text]                        ; the hook; its blr returns to RESTORE
+        tail:  [instruction?] [pad] 00000000
+
+    Because *we* issue the `bl`, the hook's `blr` returns into the payload (to
+    RESTORE), never to the game's LR — so no blr rewriting is needed and helper
+    functions just work. The entry is placed first in .text by the linker script,
+    so `bl entry` reaches it at a fixed distance past RESTORE.
+
+    (ASM hooks never reach here — build_c_hook routes them to build_asm_hook.)"""
+    text = extract_section(elf_path, ".text")
+    if not text:
+        die(f"Hook '{entry}' produced no .text — is the function empty?")
+    # Size, not extracted bytes: an all-.bss data table is NOBITS, so objcopy emits
+    # nothing for it even though the statics need real, zero-filled r31 storage.
+    picsize = elf_section_size(elf_path, ".picdata")
+    if picsize:
+        picdata = extract_section(elf_path, ".picdata")
+        if len(picdata) < picsize:
+            picdata += b"\x00" * (picsize - len(picdata))   # zero-fill .bss tail
+        picdata += b"\x00" * ((-len(picdata)) % 4)           # 4-byte align mflr r31
+        text     = patch_lis_for_pic(text)
+    else:
+        picdata = b""
+    used_fprs  = detect_used_fprs(text, set(), debug)
+    frame_size = compute_frame_size(used_fprs)
+    backup     = build_backup(frame_size, used_fprs)
+    restore    = build_restore(frame_size, used_fprs)
+    # `bl entry` spans itself (4) + RESTORE + the tail branch (4) to reach .text.
+    bl_word = struct.pack(">I", BL_BASE | ((8 + len(restore)) & 0x03FFFFFC))
+    if is_c0:
+        after_restore = struct.pack(">I", BLR_INSTR)                    # -> codehandler
+    else:
+        after_restore = struct.pack(">I", B_BASE | ((4 + len(text)) & 0x03FFFFFC))  # skip body
+    if picdata:
+        pic = (struct.pack(">I", BL_BASE | ((4 + len(picdata)) & 0x03FFFFFC))
+               + picdata + struct.pack(">I", MFLR_R31))
+    else:
+        pic = b""
+    payload = backup + pic + bl_word + restore + after_restore + text
+    if is_c0:
+        payload = terminate_c0(payload)
+    else:
+        payload = pad_and_terminate(payload, appended_instr, debug)
+    if len(payload) % 8 != 0:
+        die(f"Hook '{entry}': payload {len(payload)} bytes not 8-byte aligned.")
+    return payload
+def build_asm_hook(elf_path: str, entry: str, addr: int, is_c0: bool,
+                   appended_instr: int | None, debug: bool) -> list[str]:
+    """Emit an ASM hook VERBATIM — no BACKUP/RESTORE wrapper, no PIC, no blr
+    rewriting. The hook's .text (hand-written asm from ASM_CODE) is the
+    payload, exactly like a .asm injection: a C2 runs inline and falls through to
+    the handler's branch-back; a C0 must end in blr to return to the codehandler."""
+    text = extract_section(elf_path, ".text")
+    if not text:
+        die(f"ASM hook '{entry}' produced no .text — did you provide its body "
+            f"with ASM_CODE({entry}, \"...\")?")
+    if is_c0:
+        payload = finalize_c0_asm(text)          # ensure trailing blr + pad to 8B
+        print(f"[INFO]   {entry}()  ->  C0 asm ({len(payload)//8} lines)")
+        return format_c0(payload)
+    if len(text) == 4 and appended_instr is None:
+        print(f"[INFO]   {entry}()  ->  04 write (asm @ {addr:#010x})")
+        return format_04(addr, struct.unpack(">I", text)[0])
+    payload = pad_and_terminate(text, appended_instr, debug)
+    print(f"[INFO]   {entry}()  ->  {'C3' if addr >= 0x81000000 else 'C2'} asm "
+          f"@ {addr:#010x} ({len(payload)//8} lines)")
+    return format_c2(addr, payload)
+def build_c_hook(hook: dict, idx: int, obj_path: str, tmpdir: str, debug: bool) -> list[str]:
+    """Link one hook independently out of the shared object (gc-sections rooted
+    at its entry) and format it as a C2/C3 injection or a C0 per-frame code."""
+    entry = hook["entry"]
+    addr  = hook["address"]
+    is_c0 = (addr == 0)
+    tag   = f"hook{idx}_{entry}"
+    elf   = os.path.join(tmpdir, tag + ".elf")
+    ld    = os.path.join(tmpdir, tag + ".ld")
+    with open(ld, "w") as f:
+        f.write(make_linker_script(entry))
+    link_elf(obj_path, elf, ld, debug, entry=entry)
+    if debug:
+        print(f"[DEBUG] Hook '{entry}' disassembly:\n" + disassemble(elf))
+    appended = None
+    if hook["instruction"]:
+        if is_c0:
+            warn(f"Hook '{entry}': per-frame codes have no injection site; "
+                 f".instruction is ignored.")
+        else:
+            appended = assemble_instruction(hook["instruction"], tmpdir)
+            print(f"[INFO]   instruction : {hook['instruction']}  ->  {appended:#010x}")
+    if hook["flags"] & ASM_FLAG:
+        return build_asm_hook(elf, entry, addr, is_c0, appended, debug)
+    payload = build_call_payload(elf, entry, is_c0, appended, hook["flags"], debug)
+    if is_c0:
+        print(f"[INFO]   {entry}()  ->  C0 ({len(payload)//8} lines)")
+        return format_c0(payload)
+    lines = format_c2(addr, payload)
+    print(f"[INFO]   {entry}()  ->  {'C3' if addr >= 0x81000000 else 'C2'} "
+          f"@ {addr:#010x} ({len(payload)//8} lines)")
+    return lines
+def generate_c_codes(c_path: str, tmpdir: str, debug: bool) -> list[str]:
+    """Compile a C file once, read its Common.h hook records, and build one gecko
+    code per hook. Per-hook state gates wrap each code independently."""
+    obj = os.path.join(tmpdir, "unit.o")
+    compile_c(c_path, obj, debug)
+    hooks = read_hook_records(obj)
+    if not hooks:
+        die("No CGECKO_HOOK / CGECKO_FRAME records found. Declare each hook "
+            "(Common.h is included for you), e.g.\n"
+            "    CGECKO_HOOK(my_hook, .address = 0x80234567, .state = CGECKO_GAME);\n"
+            "    void my_hook(void) { ... }")
+    stripped = os.path.join(tmpdir, "unit.stripped.o")
+    strip_section(obj, stripped, ".cgecko_hooks")
+    n_c0 = sum(1 for h in hooks if not h["address"])
+    n_c2 = len(hooks) - n_c0
+    print(f"[INFO] Hooks          : {len(hooks)}  ({n_c0} C0, {n_c2} C2)")
+    all_lines: list[str] = []
+    for i, hook in enumerate(hooks):
+        print(f"[INFO] Hook {i + 1}/{len(hooks)} : {hook['entry']}()")
+        lines = build_c_hook(hook, i, stripped, tmpdir, debug)
+        gate  = CGECKO_STATE_MAP.get(hook["state"])
+        if gate:
+            a, v  = gate
+            lines = [f"{a:08X} {v:08X}"] + lines + ["E2000001 00000000"]
+            print(f"[INFO]   state gate  : {a:#010x} {v:#010x}")
+        all_lines.extend(lines)
+    return all_lines
+# ==============================================================================
 # ENTRY POINT
 # ==============================================================================
 def main():
+    # Status output uses Unicode (→, em-dashes); force UTF-8 so it can't crash on
+    # a legacy Windows console codepage (cp1252) when the PIC/arrow lines print.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure:
+            try:
+                reconfigure(encoding="utf-8")
+            except Exception:
+                pass
     parser = argparse.ArgumentParser(
         description="Convert a .c or .asm file into a C2/C3 Gecko code for GameCube modding."
     )
@@ -1300,7 +1042,9 @@ def main():
     is_asm   = (ext == ".asm")
     is_ini   = (ext == ".ini")
     raw_mode = is_asm
-    with open(c_path, "r") as f:
+    # utf-8: sources routinely carry box-drawing/em-dash comments, which the
+    # legacy Windows default codepage (cp1252) cannot decode.
+    with open(c_path, "r", encoding="utf-8") as f:
         source = f.read()
     if is_ini:
         blocks = parse_gecko_blocks(source)
@@ -1327,51 +1071,50 @@ def main():
     base_name = os.path.splitext(os.path.basename(c_path))[0]
     name      = base_name                      # gecko code name (preserves spaces)
 
-    author = parse_author(source)
-    notes  = parse_notes(source, is_asm)
-    state  = parse_file_state(source)
-    cond_addr, cond_value = state if state else (None, None)
-
-    sections = split_codes(source, is_asm)
-    if not sections:
-        die("No code sections found — need a C0 region (code before the first "
-            "// Address:) or at least one // Address: comment.")
-
-    n_c0 = sum(1 for s in sections if s["type"] == "c0")
-    n_c2 = sum(1 for s in sections if s["type"] == "c2")
+    author = parse_author(source)              # cosmetic, from a // Author: comment
+    notes  = parse_notes(source, is_asm)       # cosmetic, from // * comments
 
     print(f"[INFO] Mode           : {'ASM' if is_asm else 'C'}")
     print(f"[INFO] Name           : {name}")
-    print(f"[INFO] Sections       : {len(sections)}  ({n_c0} C0, {n_c2} C2)")
     if author:
         print(f"[INFO] Author         : {author}")
-    if state:
-        print(f"[INFO] State          : file-level conditional wrapper "
-              f"{state[0]:#010x} {state[1]:#010x}")
 
     check_tools(need_gcc=not is_asm)
 
     tmpdir = tempfile.mkdtemp(prefix="c2gecko_")
     try:
-        all_code_lines: list[str] = []
-        for i, section in enumerate(sections):
-            loc = (f"{section['address']:#010x}" if section["address"] is not None
-                   else "leading region")
-            extra = (f"  // Instruction: {section['instruction']}"
-                     if section.get("instruction") else "")
-            sec_state = section.get("state")
-            if sec_state:
-                extra += f"  // State: {sec_state[0]:#010x} {sec_state[1]:#010x}"
-            print(f"[INFO] Section {i + 1}/{len(sections)} : "
-                  f"{section['type'].upper():3} @ {loc}{extra}")
-
-            lines = _build_section(section, i, tmpdir, is_asm, debug)
-            if sec_state:
-                # gate this injection alone; nests fine inside a file-level State
-                s_addr, s_val = sec_state
-                lines = ([f"{s_addr:08X} {s_val:08X}"] + lines
-                         + ["E2000001 00000000"])
-            all_code_lines.extend(lines)
+        if is_asm:
+            # ASM keeps the comment-based directives (# Address:, file-level # State:);
+            # it is the raw escape hatch and has no #include / metadata-section story.
+            file_state = parse_file_state(source)
+            cond_addr, cond_value = file_state if file_state else (None, None)
+            if file_state:
+                print(f"[INFO] State          : file-level conditional wrapper "
+                      f"{file_state[0]:#010x} {file_state[1]:#010x}")
+            sections = split_codes(source, is_asm=True)
+            if not sections:
+                die("No code sections found — need a C0 region (code before the "
+                    "first # Address:) or at least one # Address: comment.")
+            n_c0 = sum(1 for s in sections if s["type"] == "c0")
+            n_c2 = sum(1 for s in sections if s["type"] == "c2")
+            print(f"[INFO] Sections       : {len(sections)}  ({n_c0} C0, {n_c2} C2)")
+            all_code_lines: list[str] = []
+            for i, section in enumerate(sections):
+                loc = (f"{section['address']:#010x}" if section["address"] is not None
+                       else "leading region")
+                sec_state = section.get("state")
+                print(f"[INFO] Section {i + 1}/{len(sections)} : "
+                      f"{section['type'].upper():3} @ {loc}")
+                lines = _build_section(section, i, tmpdir, is_asm, debug)
+                if sec_state:
+                    s_addr, s_val = sec_state
+                    lines = ([f"{s_addr:08X} {s_val:08X}"] + lines
+                             + ["E2000001 00000000"])
+                all_code_lines.extend(lines)
+        else:
+            # C: metadata comes from Common.h .cgecko_hooks records (per-hook state gates).
+            cond_addr, cond_value = None, None
+            all_code_lines = generate_c_codes(c_path, tmpdir, debug)
 
         if not all_code_lines:
             die("No gecko code lines were generated.")
