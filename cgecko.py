@@ -776,11 +776,11 @@ CGECKO_INSTR_MAX   = 64
 # struct CGeckoHook: u32 address, u32 state, u32 flags, char[64] instruction, ptr fn
 CGECKO_RECORD_SIZE = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4
 CGECKO_FN_OFFSET   = 4 + 4 + 4 + CGECKO_INSTR_MAX
-# Common.h CGECKO_* state tags -> Project Rio scene-id conditional (addr, value).
+# Common.h MSSB_* state tags -> Project Rio scene-id conditional (addr, value).
 CGECKO_STATE_MAP = {
-    1: (0x280E877C, 0x00000000),   # CGECKO_BOOT
-    2: (0x280E877C, 0x00000004),   # CGECKO_MENU
-    3: (0x280E877C, 0x00000005),   # CGECKO_GAME
+    1: (0x280E877C, 0x00000000),   # MSSB_BOOT
+    2: (0x280E877C, 0x00000004),   # MSSB_MENU
+    3: (0x280E877C, 0x00000005),   # MSSB_GAME
 }
 def parse_relocs(obj_path: str, section: str) -> dict[int, str]:
     """Map relocation offset -> target symbol name for one section, read from the
@@ -834,7 +834,7 @@ def read_hook_records(obj_path: str) -> list[dict]:
                 warn(f"Hook '{entry}': address {address:#x} outside typical GC RAM.")
         if state and state not in CGECKO_STATE_MAP:
             die(f"Hook '{entry}': unknown state tag {state}. "
-                f"Use CGECKO_ALWAYS / CGECKO_BOOT / CGECKO_MENU / CGECKO_GAME.")
+                f"Use MSSB_ALWAYS / MSSB_BOOT / MSSB_MENU / MSSB_GAME.")
         hooks.append({"address": address, "state": state, "flags": flags,
                       "instruction": instr or None, "entry": entry})
     return hooks
@@ -904,13 +904,13 @@ def build_call_payload(elf_path: str, entry: str, is_c0: bool,
 def build_asm_hook(elf_path: str, entry: str, addr: int, is_c0: bool,
                    appended_instr: int | None, debug: bool) -> list[str]:
     """Emit an ASM hook VERBATIM — no BACKUP/RESTORE wrapper, no PIC, no blr
-    rewriting. The hook's .text (hand-written asm from ASM_CODE) is the
+    rewriting. The hook's .text (the hand-written asm body of ASM()) is the
     payload, exactly like a .asm injection: a C2 runs inline and falls through to
     the handler's branch-back; a C0 must end in blr to return to the codehandler."""
     text = extract_section(elf_path, ".text")
     if not text:
-        die(f"ASM hook '{entry}' produced no .text — did you provide its body "
-            f"with ASM_CODE({entry}, \"...\")?")
+        die(f"ASM hook '{entry}' produced no .text — is the body string of "
+            f"ASM({entry}, \"...\") empty?")
     if is_c0:
         payload = finalize_c0_asm(text)          # ensure trailing blr + pad to 8B
         print(f"[INFO]   {entry}()  ->  C0 asm ({len(payload)//8} lines)")
@@ -961,10 +961,11 @@ def generate_c_codes(c_path: str, tmpdir: str, debug: bool) -> list[str]:
     compile_c(c_path, obj, debug)
     hooks = read_hook_records(obj)
     if not hooks:
-        die("No CGECKO_HOOK / CGECKO_FRAME records found. Declare each hook "
-            "(Common.h is included for you), e.g.\n"
-            "    CGECKO_HOOK(my_hook, .address = 0x80234567, .state = CGECKO_GAME);\n"
-            "    void my_hook(void) { ... }")
+        die("No CGECKO / ASM records found. Declare each code (Common.h is "
+            "included for you), e.g.\n"
+            "    CGECKO(my_code, .address = 0x80234567, .state = MSSB_GAME);\n"
+            "    void my_code(void) { ... }\n"
+            "Omit .address for a code that runs once per frame.")
     stripped = os.path.join(tmpdir, "unit.stripped.o")
     strip_section(obj, stripped, ".cgecko_hooks")
     n_c0 = sum(1 for h in hooks if not h["address"])

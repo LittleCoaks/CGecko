@@ -27,92 +27,96 @@ typedef unsigned char  byte;
 typedef unsigned short halfword;
 typedef unsigned int   word;
 
-/* ── Hook declarations ───────────────────────────────────────────────────────
+/* ── Code declarations ───────────────────────────────────────────────────────
  *
- * Declare each hook with CGECKO_HOOK (an injection at a game address) or
- * CGECKO_FRAME (a per-frame code). cgecko reads these records straight out of
- * the compiled object's `.cgecko_hooks` section, so the metadata survives
- * #include and travels with the code it belongs to — unlike a comment, which
- * the preprocessor discards.
+ * Two macros — one per language:
  *
- * A hook is an ordinary `void name(void)` function. cgecko wraps it: it saves
- * the game's registers, establishes the PIC base (r31), CALLS your function,
- * then restores the game's registers and hands control back. Write normal C —
- * locals, helper calls, and READ_GAME_REG/WRITE_GAME_REG (below) all work in
- * the hook body.
+ *     CGECKO(name, ...)          declares a C code; you write `void name(void)`
+ *     ASM(name, "body", ...)     declares an asm code; the body IS the string
  *
- *     CGECKO_HOOK(on_hit, .address = 0x80234567, .state = CGECKO_GAME,
- *                         .instruction = "lwz r3, 0(r4)");
- *     void on_hit(void) { ... }
+ * There is no separate "hook" vs "per-frame" macro. Pass `.address` and the code
+ * is injected at that game address (Gecko C2/C3); omit `.address` and it runs
+ * once every frame (Gecko C0). Field order is free, and any omitted field is
+ * zero — i.e. MSSB_ALWAYS, no instruction.
  *
- * The CGECKO_HOOK line may sit before or after the function (the macro forward-
- * declares it). Field order is free; any omitted field is zero — i.e.
- * CGECKO_ALWAYS, no instruction, no flags.
+ *     Fields    .address       injection site; omit for a per-frame code
+ *               .state         MSSB_ALWAYS / MSSB_BOOT / MSSB_MENU / MSSB_GAME
+ *               .instruction   PPC asm re-run just before returning to the game
+ *
+ * cgecko reads these records straight out of the compiled object's
+ * `.cgecko_hooks` section, so the metadata survives #include and travels with
+ * the code it belongs to — unlike a comment, which the preprocessor discards.
  */
 
-/* Scene gates. cgecko maps these to Project Rio scene-id compares; a hook runs
+/* Scene gates. cgecko maps these to Project Rio scene-id compares; a code runs
  * only when the game is in the named state. MSSB_ALWAYS runs unconditionally. */
 #define MSSB_ALWAYS 0
 #define MSSB_BOOT   1
 #define MSSB_MENU   2
 #define MSSB_GAME   3
 
-/* Hook flags. */
-#define ASM        (1u << 0)   /* raw inline asm, no save/restore wrapper —
-                                * you manage registers and returns yourself. */
+/* Internal record flags — set by the macros, never by hand. */
+#define CGECKO_ASM_FLAG  (1u << 0)   /* body is verbatim asm, no wrapper */
 
 /* Max length of an .instruction string (inline in the record, so cgecko needs
  * no relocation to read it). PPC mnemonics are short; 64 is ample. */
 #define CGECKO_INSTR_MAX 64
 
 struct CGeckoHook {
-    word   address;                              /* injection site; 0 = per-frame (C0) */
-    word   state;                                /* MSSB_ALWAYS / MSSB_MENU / ...  */
-    word   flags;                                /* ASM | ...                          */
-    char   instruction[CGECKO_INSTR_MAX];        /* asm re-run after the body, or ""   */
-    void (*fn)(void);                            /* the hook body                      */
+    word   address;                        /* injection site; 0 = per-frame (C0) */
+    word   state;                          /* MSSB_ALWAYS / MSSB_MENU / ...       */
+    word   flags;                          /* CGECKO_ASM_FLAG | ...               */
+    char   instruction[CGECKO_INSTR_MAX];  /* asm re-run after the body, or ""    */
+    void (*fn)(void);                      /* the code body                       */
 };
 
-#define CGECKO_HOOK(fn_, ...)                                                     \
-    void fn_(void);                                                              \
-    static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used)) \
+#define _CGECKO_RECORD(fn_, ...)                                                   \
+    void fn_(void);                                                                \
+    static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used))  \
         _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_), ##__VA_ARGS__ }
 
-/* A per-frame code (Gecko C0): no injection address; the codehandler runs it
- * once every frame. Same as CGECKO_HOOK with address 0. */
-#define CGECKO_FRAME(fn_, ...) \
-    CGECKO_HOOK(fn_, .address = 0, ##__VA_ARGS__)
-
-/* ── ASM (unwrapped) hooks ───────────────────────────────────────────────────
- * An ASM hook runs VERBATIM at the injection site — no BACKUP/RESTORE wrapper and
- * no call, exactly like a hand-written .asm injection. r3–r31 are the game's
- * LIVE registers, and you manage registers and returns yourself. ASM hooks
- * cannot use C `static` data (there is no PIC base) — use absolute / claimed
- * addresses. (`naked` C functions are not an option: PPC GCC ignores `naked`,
- * so the body is emitted verbatim through top-level asm via ASM_CODE.)
+/* ── CGECKO: a C code ────────────────────────────────────────────────────────
+ * The body is an ordinary `void name(void)` function. cgecko wraps it: it saves
+ * the game's registers, establishes the PIC base (r31), CALLS your function,
+ * then restores the game's registers and hands control back. Write normal C —
+ * locals, helper calls, and READ_GAME_REG/WRITE_GAME_REG (below) all work.
  *
- *     ASM_HOOK(bump, .address = 0x80100000, .state = CGECKO_GAME);
- *     ASM_CODE(bump,
- *         "addi 3, 3, 1 \n"      // r3 is the game's live r3 here
- *         "stw  3, 0(4) \n");    // pass the asm as ADJACENT string literals
+ *     CGECKO(on_hit, .address = 0x80234567, .state = MSSB_GAME,
+ *                    .instruction = "lwz r3, 0(r4)");
+ *     void on_hit(void) { ... }
  *
- * A C2 ASM hook runs inline and then falls through to the handler's branch-back,
- * so end by falling through — no trailing blr. An ASM_FRAME (per-frame C0)
- * must end in `blr` to return to the codehandler. */
-#define ASM_HOOK(fn_, ...) \
-    void fn_(void); \
-    static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used)) \
-        _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_), .flags = ASM, ##__VA_ARGS__ }
+ *     CGECKO(each_frame, .state = MSSB_GAME);   // no .address -> runs per frame
+ *     void each_frame(void) { ... }
+ *
+ * The CGECKO line may sit before or after the function (the macro forward-
+ * declares it). */
+#define CGECKO(fn_, ...) _CGECKO_RECORD(fn_, ##__VA_ARGS__)
 
-#define ASM_FRAME(fn_, ...) \
-    ASM_HOOK(fn_, .address = 0, ##__VA_ARGS__)
-
-/* Emit an ASM hook's body verbatim (its own .text section, matched by fn name). */
-#define ASM_CODE(fn_, ...) asm( \
-    ".section .text." #fn_ ",\"ax\",@progbits\n" \
-    ".globl " #fn_ "\n" \
-    #fn_ ":\n" \
-    __VA_ARGS__ )
+/* ── ASM: a raw, unwrapped code ──────────────────────────────────────────────
+ * The body runs VERBATIM — no BACKUP/RESTORE wrapper and no call, exactly like a
+ * hand-written .asm injection. r3–r31 are the game's LIVE registers, and you
+ * manage registers and returns yourself. An ASM code cannot use C `static` data
+ * (there is no PIC base) — use absolute / claimed addresses. (`naked` C
+ * functions are not an option: PPC GCC ignores `naked`, so the body is emitted
+ * verbatim through top-level asm.)
+ *
+ * The body is the SECOND argument — adjacent string literals, no commas between
+ * them — and any metadata follows it:
+ *
+ *     ASM(bump,
+ *         "addi 3, 3, 1 \n"                  // r3 is the game's live r3 here
+ *         "stw  3, 0(4) \n",
+ *         .address = 0x80100000, .state = MSSB_GAME);
+ *
+ * An injected (C2) ASM code runs inline and then falls through to the handler's
+ * branch-back, so end by falling through — no trailing blr. A per-frame (C0) ASM
+ * code — one with no .address — must end in `blr` to return to the codehandler. */
+#define ASM(fn_, body_, ...)                                  \
+    _CGECKO_RECORD(fn_, .flags = CGECKO_ASM_FLAG, ##__VA_ARGS__); \
+    asm(".section .text." #fn_ ",\"ax\",@progbits\n"          \
+        ".globl " #fn_ "\n"                                   \
+        #fn_ ":\n"                                            \
+        body_)
 
 /* ── Memory access ───────────────────────────────────────────────────────── */
 /*
