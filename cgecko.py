@@ -57,6 +57,8 @@ AS_FLAGS = [
     "-mregnames",
     "-mbig",
     f"-I{os.path.dirname(SCRIPT_DIR)}",
+    f"-I{SCRIPT_DIR}",   # Common.s ships next to cgecko.py, so a mod can just
+                         # write `.include "Common.s"` (mirrors GCC_FLAGS)
 ]
 # ==============================================================================
 # CONSTANTS
@@ -785,9 +787,14 @@ CGECKO_STATE_MAP = {
 def parse_relocs(obj_path: str, section: str) -> dict[int, str]:
     """Map relocation offset -> target symbol name for one section, read from the
     object's .rela<section>. Used to resolve each CGeckoHook.fn pointer to its entry
-    function name (the rest of the record is plain integers / inline chars)."""
+    function name (the rest of the record is plain integers / inline chars).
+
+    -W (wide) is REQUIRED: plain `readelf -r` truncates a symbol name past 22
+    characters to 'LongFunctionNam[...]', which then resolves to nothing at link
+    time ("produced no .text"). With -W the full name is printed and the column
+    layout is unchanged."""
     out: dict[int, str] = {}
-    txt = subprocess.run([READELF, "-r", obj_path],
+    txt = subprocess.run([READELF, "-rW", obj_path],
                          capture_output=True, text=True).stdout
     want, in_block = f"'.rela{section}'", False
     for line in txt.splitlines():
