@@ -358,7 +358,10 @@ def get_libgcc() -> str:
     return result.stdout.strip()
 def link_elf(obj_path: str, elf_path: str, ld_path: str, debug: bool, entry: str | None = None):
     libgcc = get_libgcc()
-    cmd    = [LD, "-T", ld_path, "--nostdlib"]
+    # --emit-relocs keeps the relocation records in the linked ELF. They are what
+    # find_picdata_relocs() reads to discover pointers the linker baked INTO the
+    # data section (which need runtime fixup — see build_pic_reloc_fixup).
+    cmd    = [LD, "-T", ld_path, "--nostdlib", "--emit-relocs"]
     if entry:
         cmd += ["--gc-sections", f"--entry={entry}"]
     cmd   += [obj_path, libgcc, "-o", elf_path]
@@ -512,6 +515,92 @@ def patch_lis_for_pic(text: bytes) -> bytes:
     if to_remove:
         print(f"[INFO] PIC: nop'd {len(to_remove)} 'lis rN, 0', base uses → r31")
     return struct.pack(f">{len(words)}I", *words)
+# ------------------------------------------------------------------ PIC: data
+# patch_lis_for_pic (above) only fixes CODE that FORMS an address. It cannot fix
+# a pointer VALUE the linker baked INTO the data section — e.g.
+#     static const struct { const char *name; int op; } tags[] = {{"reset",5},…};
+#     const char *items[] = { "a", "b" };      // even as a LOCAL: GCC hoists it
+# Those emit R_PPC_ADDR32 records against .picdata. Since the linker script puts
+# .picdata at VMA 0, the baked value is the target's OFFSET from picdata start,
+# and at runtime picdata start is exactly r31 — so the fixup is simply
+#     *(u32*)(r31 + off) = r31 + baked_value
+# applied once per record at payload entry, before the hook body runs.
+# Before this existed, such a pointer read back as a raw link-time offset (0x28,
+# 0x60, …) and dereferencing it faulted instantly.
+def find_picdata_relocs(elf_path: str, picsize: int, debug: bool) -> list[tuple[int, int]]:
+    """Relocations landing inside .picdata, as (offset_in_picdata, addend).
+    Requires the ELF to have been linked with --emit-relocs."""
+    if not picsize:
+        return []
+    out = subprocess.run([READELF, "-rW", elf_path],
+                         capture_output=True, text=True).stdout
+    relocs, unsupported = [], []
+    for line in out.splitlines():
+        m = re.match(r"^([0-9A-Fa-f]{8})\s+[0-9A-Fa-f]{8}\s+(\S+)", line.strip())
+        if not m:
+            continue
+        off, rtype = int(m.group(1), 16), m.group(2)
+        if off >= picsize:      # .text relocs live past picdata (VMA order)
+            continue
+        if rtype != "R_PPC_ADDR32":
+            unsupported.append((off, rtype))
+            continue
+        relocs.append(off)
+    if unsupported:
+        detail = ", ".join(f"{t} @ +0x{o:X}" for o, t in unsupported[:4])
+        die(f"Unsupported relocation(s) inside .picdata: {detail}.\n"
+            f"       cgecko can only fix up R_PPC_ADDR32 pointers in data.")
+    return sorted(relocs)
+def build_pic_reloc_fixup(picdata: bytes, relocs: list[int],
+                          debug: bool) -> tuple[bytes, bytes]:
+    """Return (picdata_with_reloc_table_appended, fixup_code).
+
+    The table is len(relocs) pairs of (target_offset, addend); addend is the
+    value the LINKER baked in, read back out of picdata. Writing
+    `r31 + addend` (rather than `+=`) keeps the fixup IDEMPOTENT, which it must
+    be: the codehandler re-enters this payload every frame (C0) / every hit (C2).
+    """
+    if not relocs:
+        return picdata, b""
+    for off in relocs:
+        target = struct.unpack(">I", picdata[off:off + 4])[0]
+        if target >= len(picdata):
+            die(f"Data pointer at .picdata+0x{off:X} targets 0x{target:X}, which "
+                f"is outside .picdata (likely a function pointer in a data "
+                f"table).\n       cgecko cannot relocate those yet — rewrite it "
+                f"to avoid a pointer stored in static data.")
+    table_off = len(picdata)
+    if table_off > 0x7FFF:
+        die(f".picdata is {table_off} bytes — too large for the r31-relative "
+            f"reloc table (addi limit 32767).")
+    table = b"".join(struct.pack(">II", off,
+                                 struct.unpack(">I", picdata[off:off + 4])[0])
+                     for off in relocs)
+    # r3 = count, r4 = table cursor; both are inside the r3..r31 range that
+    # BACKUP's `stmw r3` already saved, so clobbering them here is safe.
+    # CTR is deliberately avoided (addic./bne instead of bdnz) so this cannot
+    # disturb a game `bctr` sequence straddling a C2 injection site.
+    ADDIC_DOT = lambda d, a, i: (13 << 26) | (d << 21) | (a << 16) | (i & 0xFFFF)
+    LWZ       = lambda d, a, o: (32 << 26) | (d << 21) | (a << 16) | (o & 0xFFFF)
+    ADD       = lambda d, a, b: (31 << 26) | (d << 21) | (a << 16) | (b << 11) | (266 << 1)
+    STWX      = lambda s, a, b: (31 << 26) | (s << 21) | (a << 16) | (b << 11) | (151 << 1)
+    BNE       = lambda bd:      (16 << 26) | (4  << 21) | (2 << 16) | (bd & 0xFFFC)
+    code = _pack(
+        _addi(3, 0, len(relocs)),        # li    r3, N
+        _addi(4, 31, table_off),         # addi  r4, r31, table_off
+        LWZ(5, 4, 0),                    # loop: lwz r5, 0(r4)   -- target offset
+        LWZ(6, 4, 4),                    #       lwz r6, 4(r4)   -- baked addend
+        ADD(6, 6, 31),                   #       add r6, r6, r31 -- runtime address
+        STWX(6, 31, 5),                  #       stwx r6, r31, r5
+        _addi(4, 4, 8),                  #       addi r4, r4, 8
+        ADDIC_DOT(3, 3, -1),             #       addic. r3, r3, -1
+        BNE(-24),                        #       bne loop
+    )
+    print(f"[INFO] PIC: {len(relocs)} data pointer(s) fixed up at runtime")
+    if debug:
+        print(f"[DEBUG] reloc table at .picdata+0x{table_off:X}, "
+              f"offsets: {[hex(o) for o in relocs]}")
+    return picdata + table, code
 def pad_and_terminate(payload: bytes,
                        appended_instr: int | None,
                        debug: bool) -> bytes:
@@ -877,12 +966,17 @@ def build_call_payload(elf_path: str, entry: str, is_c0: bool,
     # Size, not extracted bytes: an all-.bss data table is NOBITS, so objcopy emits
     # nothing for it even though the statics need real, zero-filled r31 storage.
     picsize = elf_section_size(elf_path, ".picdata")
+    reloc_fixup = b""
     if picsize:
         picdata = extract_section(elf_path, ".picdata")
         if len(picdata) < picsize:
             picdata += b"\x00" * (picsize - len(picdata))   # zero-fill .bss tail
         picdata += b"\x00" * ((-len(picdata)) % 4)           # 4-byte align mflr r31
         text     = patch_lis_for_pic(text)
+        # Pointers the linker baked INTO the data section need a runtime fixup;
+        # patch_lis_for_pic only handles addresses formed by code.
+        relocs   = find_picdata_relocs(elf_path, picsize, debug)
+        picdata, reloc_fixup = build_pic_reloc_fixup(picdata, relocs, debug)
     else:
         picdata = b""
     used_fprs  = detect_used_fprs(text, set(), debug)
@@ -896,8 +990,10 @@ def build_call_payload(elf_path: str, entry: str, is_c0: bool,
     else:
         after_restore = struct.pack(">I", B_BASE | ((4 + len(text)) & 0x03FFFFFC))  # skip body
     if picdata:
+        # bl lands on the mflr (LR = picdata start -> r31). reloc_fixup runs
+        # right after, so baked data pointers are valid before the hook body.
         pic = (struct.pack(">I", BL_BASE | ((4 + len(picdata)) & 0x03FFFFFC))
-               + picdata + struct.pack(">I", MFLR_R31))
+               + picdata + struct.pack(">I", MFLR_R31) + reloc_fixup)
     else:
         pic = b""
     payload = backup + pic + bl_word + restore + after_restore + text
