@@ -5,7 +5,6 @@ import sys
 import os
 import argparse
 import subprocess
-import glob
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CGECKO     = os.path.join(SCRIPT_DIR, "cgecko.py")
@@ -14,11 +13,18 @@ ROOT_DIR   = os.path.dirname(SCRIPT_DIR)
 
 def find_sources() -> list[str]:
     sources = []
-    for pattern in ("**/*.c", "**/*.asm", "**/*.ini"):
-        for path in glob.glob(os.path.join(ROOT_DIR, pattern), recursive=True):
-            if path.endswith(".rewritten.c"):
+    for dirpath, dirnames, filenames in os.walk(ROOT_DIR):
+        # Don't descend into submodules (or any other nested git repo, e.g. a
+        # decomp checkout) -- their sources aren't gecko codes, and a large
+        # one can dominate the scan.
+        dirnames[:] = [d for d in dirnames
+                       if not d.startswith(".")
+                       and not os.path.exists(os.path.join(dirpath, d, ".git"))]
+        for name in filenames:
+            if name.endswith(".rewritten.c"):
                 continue
-            sources.append(path)
+            if name.endswith((".c", ".asm", ".ini")):
+                sources.append(os.path.join(dirpath, name))
     return sorted(sources)
 
 
