@@ -77,6 +77,7 @@ struct CGeckoHook {
     word   gate_addr;                      /* runtime on/off switch; 0 = always on */
     word   gate_value;                     /* the u32 that switch must hold to run  */
     char   notes[CGECKO_NOTES_MAX];        /* what the code does, or ""            */
+    word   option_addr;                    /* the option word .notes describes      */
 };
 
 /* ── .notes: a code's description, as data ───────────────────────────────────
@@ -97,18 +98,31 @@ struct CGeckoHook {
  * translation unit, so cgecko_iso can collect every record's .notes into a
  * table and hand it back through:
  *
- *     const char* CGecko_NotesForGate(word gate_addr);
+ *     const char* CGecko_NotesForOption(word option_addr);
  *
- * Keyed on the code's CGECKO_GATE_ADDR because that is what a mod-options UI
- * already has: a menu row owns the toggle word, so it can ask for the notes of
- * whatever mod that word switches. Returns 0 when no code with that gate
- * declared .notes; a gate of 0 never matches, so ungated codes are skipped.
+ * Keyed on CGECKO_OPTION_ADDR (below), which defaults to the code's gate --
+ * because that is what a mod-options UI already has: a menu row owns the
+ * toggle word, so it can ask for the notes of whatever mod that word
+ * switches. Returns 0 when no code with that option declared .notes; an
+ * option of 0 never matches, so a code belonging to nothing is skipped.
  *
  * ONLY IN DOL-BAKED BUILDS. The gecko path links each hook separately, so a mod
  * included beside yours is not in your translation unit and its notes cannot be
- * reached; cgecko emits them to the ini and stops there. Referencing this from
- * a code built as a gecko code is a link error, which is the honest outcome. */
-const char* CGecko_NotesForGate(word gate_addr);
+ * reached; cgecko emits them to the ini and stops there.
+ *
+ * So that one source file can build BOTH ways, the gecko path gets a stub that
+ * always returns 0 rather than a link error -- a UI that shows notes then simply
+ * shows none, instead of the file failing to build as a gecko code at all.
+ * cgecko_iso defines CGECKO_ISO in the unit it generates; nothing else does. */
+#ifdef CGECKO_ISO
+const char* CGecko_NotesForOption(word option_addr);
+#else
+static inline const char* CGecko_NotesForOption(word option_addr)
+{
+    (void)option_addr;
+    return 0;
+}
+#endif
 
 /* -- CGECKO_GATE_ADDR / _VALUE: gate whole codes at INCLUDE time -----------
  * Every record picks up whatever these hold WHERE THE CGECKO()/ASM() LINE IS
@@ -133,12 +147,36 @@ const char* CGecko_NotesForGate(word gate_addr);
 #define CGECKO_GATE_VALUE 1
 #endif
 
+/* -- CGECKO_OPTION_ADDR: which option a code's .notes describe --------------
+ * The key CGecko_NotesForOption() looks notes up by. It defaults to the gate,
+ * because a gated mod's gate IS the option it belongs to and repeating the
+ * address would only be a chance to get it wrong.
+ *
+ * Set it separately for a mod that reads its option itself instead of being
+ * wrapped in one. Duplicate Characters is the case: it patches game code, so
+ * it has to keep running while the option is OFF in order to put the original
+ * instructions back, which a gate-wrapped code can never do. It still belongs
+ * to that option, and its notes still have to be findable under it:
+ *
+ *     #undef  CGECKO_OPTION_ADDR
+ *     #define CGECKO_OPTION_ADDR MODOPT_ADDR(MODOPT_DUPLICATES)
+ *     #include "Gecko Codes/Menu/Duplicate Characters.c"
+ *     #undef  CGECKO_OPTION_ADDR
+ *     #define CGECKO_OPTION_ADDR CGECKO_GATE_ADDR
+ *
+ * Expansion happens where the CGECKO()/ASM() line is, so the default tracks
+ * whatever CGECKO_GATE_ADDR holds at that point rather than what it held here. */
+#ifndef CGECKO_OPTION_ADDR
+#define CGECKO_OPTION_ADDR CGECKO_GATE_ADDR
+#endif
+
 #define _CGECKO_RECORD(fn_, ...)                                                   \
     void fn_(void);                                                                \
     static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used))  \
         _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_),                          \
-                              .gate_addr  = CGECKO_GATE_ADDR,                       \
-                              .gate_value = CGECKO_GATE_VALUE, ##__VA_ARGS__ }
+                              .gate_addr   = CGECKO_GATE_ADDR,                      \
+                              .gate_value  = CGECKO_GATE_VALUE,                     \
+                              .option_addr = CGECKO_OPTION_ADDR, ##__VA_ARGS__ }
 
 /* ── CGECKO: a C code ────────────────────────────────────────────────────────
  * The body is an ordinary `void name(void)` function. cgecko wraps it: it saves

@@ -137,6 +137,12 @@ def _cond(hook):
     return " && ".join(parts) if parts else None
 
 
+# Tells Common.h this is a baked build, which switches CGecko_NotesForOption
+# from its always-0 gecko stub to the table generated here. It has to be a -D:
+# Common.h is force-included, so it is preprocessed ahead of the unit's own
+# first line and a #define in the generated source would come too late.
+ISO_DEFINES = ["-DCGECKO_ISO=1"]
+
 PATCH_TABLE = "_iso_rel_patches"
 DC_FLUSH = 0x8006E894
 IC_INVALIDATE = 0x8006E94C
@@ -164,7 +170,7 @@ def c_string(text):
 
 
 def generate_notes_table(hooks):
-    """Emit CGecko_NotesForGate() over every record that declared .notes.
+    """Emit CGecko_NotesForOption() over every record that declared .notes.
 
     Common.h declares this; the definition can only exist here, because a
     baked build is the one place the whole pack is a single translation unit
@@ -172,29 +178,31 @@ def generate_notes_table(hooks):
     rather than pointed at: the records live in .cgecko_hooks, which is
     stripped before linking, so nothing may reference them at runtime.
 
-    Keyed on gate_addr because that is the key a mod-options UI already holds
-    -- a menu row owns the toggle word, so it can ask for the notes of the mod
-    that word switches. Codes with no gate are skipped: gate 0 is 'always on',
-    which is not a key, and every ungated code would otherwise collide on it."""
+    Keyed on option_addr (CGECKO_OPTION_ADDR, which defaults to the gate)
+    because that is the key a mod-options UI already holds -- a menu row owns
+    the toggle word, so it can ask for the notes of the mod that word
+    switches. Codes belonging to no option are skipped: 0 is not a key, and
+    every one of them would otherwise collide on it."""
     seen, rows = set(), []
     for h in hooks:
         note = (h.get("notes") or "").strip()
-        if not note or not h["gate_addr"] or h["gate_addr"] in seen:
+        opt = h.get("option_addr") or 0
+        if not note or not opt or opt in seen:
             continue
-        seen.add(h["gate_addr"])
-        rows.append((h["gate_addr"], note, h["entry"]))
+        seen.add(opt)
+        rows.append((opt, note, h["entry"]))
 
     out = ["/* .notes, addressable at runtime. See Common.h. */",
-           "const char* CGecko_NotesForGate(unsigned int gate_addr)",
+           "const char* CGecko_NotesForOption(unsigned int option_addr)",
            "{"]
     if not rows:
-        out += ["    (void)gate_addr;",
+        out += ["    (void)option_addr;",
                 "    return 0;                    /* no code declared .notes */",
                 "}", ""]
         return "\n".join(out), rows
-    out.append("    switch (gate_addr) {")
-    for gate, note, entry in rows:
-        out.append("    case 0x%08XU: return %s;   /* %s */" % (gate, c_string(note), entry))
+    out.append("    switch (option_addr) {")
+    for opt, note, entry in rows:
+        out.append("    case 0x%08XU: return %s;   /* %s */" % (opt, c_string(note), entry))
     out += ["    default: return 0;",
             "    }",
             "}", ""]
@@ -276,7 +284,7 @@ def build(pack_path, load_addr, frame_site=None, frame_instr=None, debug=False):
 
     # ---- pass 1: what hooks does the pack declare? ------------------------
     obj1 = os.path.join(tmpdir, "pass1.o")
-    cg.compile_c(pack_path, obj1, debug)
+    cg.compile_c(pack_path, obj1, debug, ISO_DEFINES)
     hooks = cg.read_hook_records(obj1)
     if not hooks:
         cg.die("No CGECKO / ASM records found in " + pack_path)
@@ -297,14 +305,17 @@ def build(pack_path, load_addr, frame_site=None, frame_instr=None, debug=False):
     # ---- pass 2: generate scaffolding, compile the whole thing ------------
     gen_src, shims, note_rows = generate_source(pack_path, hooks)
     if note_rows:
-        print("[INFO] .notes: %d gated code(s) reachable through CGecko_NotesForGate()"
+        print("[INFO] .notes: %d option(s) reachable through CGecko_NotesForOption()"
               % len(note_rows))
-    ungated = [h["entry"] for h in hooks if (h.get("notes") or "").strip()
-               and not h["gate_addr"]]
-    if ungated:
-        cg.warn("These codes declare .notes but have no CGECKO_GATE_ADDR, so "
-                "CGecko_NotesForGate() cannot key on them and their notes are "
-                "ini-only: " + ", ".join(sorted(set(ungated))))
+        for opt, _note, entry in note_rows:
+            print("[INFO]   option 0x%08X <- %s" % (opt, entry))
+    orphan = [h["entry"] for h in hooks if (h.get("notes") or "").strip()
+              and not (h.get("option_addr") or 0)]
+    if orphan:
+        cg.warn("These codes declare .notes but belong to no option (no "
+                "CGECKO_GATE_ADDR and no CGECKO_OPTION_ADDR), so "
+                "CGecko_NotesForOption() cannot key on them and their notes are "
+                "ini-only: " + ", ".join(sorted(set(orphan))))
     gen_path = os.path.join(tmpdir, "_iso_gen.c")
     with open(gen_path, "w", encoding="utf-8") as f:
         f.write(gen_src)
@@ -312,7 +323,7 @@ def build(pack_path, load_addr, frame_site=None, frame_instr=None, debug=False):
         print("[DEBUG] generated scaffolding:\n" + gen_src)
 
     obj = os.path.join(tmpdir, "unit.o")
-    cg.compile_c(gen_path, obj, debug)
+    cg.compile_c(gen_path, obj, debug, ISO_DEFINES)
     stripped = os.path.join(tmpdir, "unit.stripped.o")
     cg.strip_section(obj, stripped, ".cgecko_hooks")
 

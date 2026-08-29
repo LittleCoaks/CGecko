@@ -345,8 +345,11 @@ def make_linker_script(func_name: str) -> str:
 # ==============================================================================
 # COMPILATION & ASSEMBLY & LINKING
 # ==============================================================================
-def compile_c(c_path: str, obj_path: str, debug: bool):
-    cmd = [GCC] + GCC_FLAGS + [c_path, "-o", obj_path]
+def compile_c(c_path: str, obj_path: str, debug: bool, extra: list[str] | None = None):
+    """`extra` goes on the command line, which is where a -D has to be: Common.h
+    is force-included, so it is preprocessed BEFORE the first line of the file
+    and a #define in the source cannot reach the #ifdefs inside it."""
+    cmd = [GCC] + GCC_FLAGS + list(extra or []) + [c_path, "-o", obj_path]
     if debug:
         print(f"[DEBUG] Compile: {' '.join(cmd)}")
     result = subprocess.run(cmd, capture_output=True, text=True)
@@ -881,9 +884,11 @@ CGECKO_INSTR_MAX   = 64
 CGECKO_NOTES_MAX   = 256
 # struct CGeckoHook: u32 address, u32 state, u32 flags, char[64] instruction,
 #                   ptr fn, u32 gate_addr, u32 gate_value
-CGECKO_RECORD_SIZE  = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4 + 4 + 4 + CGECKO_NOTES_MAX
-CGECKO_FN_OFFSET    = 4 + 4 + 4 + CGECKO_INSTR_MAX
-CGECKO_NOTES_OFFSET = CGECKO_FN_OFFSET + 4 + 4 + 4
+CGECKO_RECORD_SIZE   = (4 + 4 + 4 + CGECKO_INSTR_MAX + 4 + 4 + 4
+                        + CGECKO_NOTES_MAX + 4)
+CGECKO_FN_OFFSET     = 4 + 4 + 4 + CGECKO_INSTR_MAX
+CGECKO_NOTES_OFFSET  = CGECKO_FN_OFFSET + 4 + 4 + 4
+CGECKO_OPTION_OFFSET = CGECKO_NOTES_OFFSET + CGECKO_NOTES_MAX
 # Common.h MSSB_* state tags -> Project Rio scene-id conditional (addr, value).
 CGECKO_STATE_MAP = {
     1: (0x280E877C, 0x00000000),   # MSSB_BOOT
@@ -957,10 +962,13 @@ def read_hook_records(obj_path: str) -> list[dict]:
             die(f"Hook '{entry}': gate address {gate_addr:#x} outside GC RAM.")
         nbase = base + CGECKO_NOTES_OFFSET
         notes = _cstr(data[nbase:nbase + CGECKO_NOTES_MAX])
+        option = struct.unpack_from(">I", data, base + CGECKO_OPTION_OFFSET)[0]
+        if option and not (0x80000000 <= option <= 0x81FFFFFF):
+            die(f"Hook '{entry}': option address {option:#x} outside GC RAM.")
         hooks.append({"address": address, "state": state, "flags": flags,
                       "instruction": instr or None, "entry": entry,
                       "gate_addr": gate_addr, "gate_value": gate_value,
-                      "notes": notes})
+                      "notes": notes, "option_addr": option})
     return hooks
 def strip_section(obj_in: str, obj_out: str, section: str):
     """Copy an object with one section (and its relocations) removed, so build-

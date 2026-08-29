@@ -88,20 +88,33 @@ included it. `.notes` is data in the record, which means a **DOL-baked** build
 can hand it back at runtime:
 
 ```c
-const char* CGecko_NotesForGate(word gate_addr);   // declared in Common.h
+const char* CGecko_NotesForOption(word option_addr);  // declared in Common.h
 ```
 
-Keyed on the code's `CGECKO_GATE_ADDR`, because that is the key a mod-options
-menu already holds — a row owns the toggle word, so it can ask for the notes of
-whatever mod that word switches. Returns `0` when nothing with that gate declared
-`.notes`; ungated codes are skipped, since a gate of `0` is "always on" rather
-than a key.
+Keyed on `CGECKO_OPTION_ADDR`, which defaults to the code's `CGECKO_GATE_ADDR` —
+because that is the key a mod-options menu already holds: a row owns the toggle
+word, so it can ask for the notes of whatever mod that word switches. Returns `0`
+when nothing with that option declared `.notes`; a code belonging to no option is
+skipped, since `0` is not a key.
+
+Set `CGECKO_OPTION_ADDR` on its own for a mod that reads its option itself
+instead of being gate-wrapped — a mod that patches game code has to keep running
+while the option is OFF so it can undo itself, which a gate-wrapped code can
+never do, but it still belongs to that option:
+
+```c
+#undef  CGECKO_OPTION_ADDR
+#define CGECKO_OPTION_ADDR MODOPT_ADDR(MODOPT_DUPLICATES)
+#include "Gecko Codes/Menu/Duplicate Characters.c"
+#undef  CGECKO_OPTION_ADDR
+#define CGECKO_OPTION_ADDR CGECKO_GATE_ADDR
+```
 
 This only exists in DOL-baked builds (`cgecko_iso.py`), which link the whole pack
 as one translation unit. The gecko path links each hook separately, so a mod
 included beside yours is not in your translation unit and its notes cannot be
 reached — there, `.notes` goes to the ini and stops. Calling
-`CGecko_NotesForGate` from a code built as a gecko code is a link error.
+`CGecko_NotesForOption` from a code built as a gecko code is a link error.
 
 ### ASM codes
 
