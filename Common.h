@@ -68,12 +68,39 @@ struct CGeckoHook {
     word   flags;                          /* CGECKO_ASM_FLAG | ...               */
     char   instruction[CGECKO_INSTR_MAX];  /* asm re-run after the body, or ""    */
     void (*fn)(void);                      /* the code body                       */
+    word   gate_addr;                      /* runtime on/off switch; 0 = always on */
+    word   gate_value;                     /* the u32 that switch must hold to run  */
 };
+
+/* -- CGECKO_GATE_ADDR / _VALUE: gate whole codes at INCLUDE time -----------
+ * Every record picks up whatever these hold WHERE THE CGECKO()/ASM() LINE IS
+ * EXPANDED, so one file can wrap somebody else's mod without editing it:
+ *
+ *     #undef  CGECKO_GATE_ADDR
+ *     #define CGECKO_GATE_ADDR 0x802EB010      // a word you toggle at runtime
+ *     #include "Gecko Codes/Match/Some Mod.c"  // ALL its hooks now gated
+ *     #undef  CGECKO_GATE_ADDR
+ *     #define CGECKO_GATE_ADDR 0
+ *
+ * cgecko turns a non-zero gate into a gecko `20` (32-bit if-equal) conditional
+ * around the WHOLE code, which is stronger than an early return in the body:
+ * a gated-off C2 is never applied, so its .instruction never runs either and
+ * the game is left genuinely stock. That is the only way to switch off a
+ * REPLACE hook (.instruction = "blr"), and it works for raw ASM() codes too,
+ * which have no C body to return from. */
+#ifndef CGECKO_GATE_ADDR
+#define CGECKO_GATE_ADDR 0
+#endif
+#ifndef CGECKO_GATE_VALUE
+#define CGECKO_GATE_VALUE 1
+#endif
 
 #define _CGECKO_RECORD(fn_, ...)                                                   \
     void fn_(void);                                                                \
     static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used))  \
-        _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_), ##__VA_ARGS__ }
+        _cgeckohook_##fn_ = { .fn = (void (*)(void))(fn_),                          \
+                              .gate_addr  = CGECKO_GATE_ADDR,                       \
+                              .gate_value = CGECKO_GATE_VALUE, ##__VA_ARGS__ }
 
 /* ── CGECKO: a C code ────────────────────────────────────────────────────────
  * The body is an ordinary `void name(void)` function. cgecko wraps it: it saves

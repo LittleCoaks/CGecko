@@ -864,8 +864,9 @@ def split_codes(source: str, is_asm: bool = True) -> list[dict]:
 # ==============================================================================
 ASM_FLAG           = 0x1
 CGECKO_INSTR_MAX   = 64
-# struct CGeckoHook: u32 address, u32 state, u32 flags, char[64] instruction, ptr fn
-CGECKO_RECORD_SIZE = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4
+# struct CGeckoHook: u32 address, u32 state, u32 flags, char[64] instruction,
+#                   ptr fn, u32 gate_addr, u32 gate_value
+CGECKO_RECORD_SIZE = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4 + 4 + 4
 CGECKO_FN_OFFSET   = 4 + 4 + 4 + CGECKO_INSTR_MAX
 # Common.h MSSB_* state tags -> Project Rio scene-id conditional (addr, value).
 CGECKO_STATE_MAP = {
@@ -931,8 +932,13 @@ def read_hook_records(obj_path: str) -> list[dict]:
         if state and state not in CGECKO_STATE_MAP:
             die(f"Hook '{entry}': unknown state tag {state}. "
                 f"Use MSSB_ALWAYS / MSSB_BOOT / MSSB_MENU / MSSB_GAME.")
+        gate_addr  = struct.unpack_from(">I", data, base + CGECKO_FN_OFFSET + 4)[0]
+        gate_value = struct.unpack_from(">I", data, base + CGECKO_FN_OFFSET + 8)[0]
+        if gate_addr and not (0x80000000 <= gate_addr <= 0x81FFFFFF):
+            die(f"Hook '{entry}': gate address {gate_addr:#x} outside GC RAM.")
         hooks.append({"address": address, "state": state, "flags": flags,
-                      "instruction": instr or None, "entry": entry})
+                      "instruction": instr or None, "entry": entry,
+                      "gate_addr": gate_addr, "gate_value": gate_value})
     return hooks
 def strip_section(obj_in: str, obj_out: str, section: str):
     """Copy an object with one section (and its relocations) removed, so build-
@@ -1083,6 +1089,15 @@ def generate_c_codes(c_path: str, tmpdir: str, debug: bool) -> list[str]:
             a, v  = gate
             lines = [f"{a:08X} {v:08X}"] + lines + ["E2000001 00000000"]
             print(f"[INFO]   state gate  : {a:#010x} {v:#010x}")
+        # A runtime gate (CGECKO_GATE_ADDR) wraps the whole code in a gecko `20`
+        # 32-bit if-equal, OUTSIDE the state gate. Skipping the code entirely --
+        # rather than returning early inside the body -- is what lets a REPLACE
+        # C2 be switched off: unapplied, its .instruction never runs either.
+        if hook["gate_addr"]:
+            ga = 0x20000000 | (hook["gate_addr"] & 0x01FFFFFF)
+            lines = [f"{ga:08X} {hook['gate_value']:08X}"] + lines + ["E2000001 00000000"]
+            print(f"[INFO]   runtime gate: [{hook['gate_addr']:#010x}] == "
+                  f"{hook['gate_value']:#x}")
         all_lines.extend(lines)
     return all_lines
 # ==============================================================================
