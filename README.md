@@ -64,6 +64,44 @@ Any number of codes can live in one file — each becomes its own Gecko code und
 | `.address` | injection address | omitted → runs once per frame |
 | `.state` | `MSSB_ALWAYS` / `MSSB_BOOT` / `MSSB_MENU` / `MSSB_GAME` | `MSSB_ALWAYS` |
 | `.instruction` | PPC asm re-run just before returning to the game | none |
+| `.notes` | what the code does, in prose | none |
+
+### Describing a code: `.notes`
+
+A code's description can be a `// *` comment or the `.notes` field. Both end up
+under the code in the ini; only `.notes` survives to runtime.
+
+```c
+CGECKO(CPUAlwaysSprints, .state = MSSB_GAME,
+       .notes = "CPU runners and the selected CPU fielder\n"
+                "always sprint. Human players are\n"
+                "unaffected.");
+```
+
+Embedded newlines become separate lines wherever the notes are shown. `// *`
+comments still work and are still emitted, so nothing has to change; a file may
+use either, or both.
+
+The reason to prefer `.notes` is that a comment does not survive the
+preprocessor, so an `#include`d mod's blurb is invisible to the code that
+included it. `.notes` is data in the record, which means a **DOL-baked** build
+can hand it back at runtime:
+
+```c
+const char* CGecko_NotesForGate(word gate_addr);   // declared in Common.h
+```
+
+Keyed on the code's `CGECKO_GATE_ADDR`, because that is the key a mod-options
+menu already holds — a row owns the toggle word, so it can ask for the notes of
+whatever mod that word switches. Returns `0` when nothing with that gate declared
+`.notes`; ungated codes are skipped, since a gate of `0` is "always on" rather
+than a key.
+
+This only exists in DOL-baked builds (`cgecko_iso.py`), which link the whole pack
+as one translation unit. The gecko path links each hook separately, so a mod
+included beside yours is not in your translation unit and its notes cannot be
+reached — there, `.notes` goes to the ini and stops. Calling
+`CGecko_NotesForGate` from a code built as a gecko code is a link error.
 
 ### ASM codes
 
@@ -80,6 +118,6 @@ ASM(bump_r3,
 
 An injected `ASM` code runs inline and falls through to the handler's branch-back (don't add a trailing `blr`). A per-frame `ASM` code — one with no `.address` — must end in `blr` to return to the codehandler.
 
-See **[`example.c`](example.c)** for a complete tour of every feature, and `Common.h` for memory / register / game-function helpers. `// Author:` and `// *` note comments still work at the top of a file — they become the code's author tag and notes.
+See **[`example.c`](example.c)** for a complete tour of every feature, and `Common.h` for memory / register / game-function helpers. `// Author:` and `// *` note comments still work at the top of a file — they become the code's author tag and notes (see `.notes` above for the alternative).
 
 > `READ_GAME_REG` binds a hidden `r30` register, so use it once per function scope; to read several registers put each in its own `{ }` block. `WRITE_GAME_REG` is self-scoped and can be used freely.

@@ -42,6 +42,7 @@ typedef unsigned int   word;
  *     Fields    .address       injection site; omit for a per-frame code
  *               .state         MSSB_ALWAYS / MSSB_BOOT / MSSB_MENU / MSSB_GAME
  *               .instruction   PPC asm re-run just before returning to the game
+ *               .notes         what the code does, in prose (see below)
  *
  * cgecko reads these records straight out of the compiled object's
  * `.cgecko_hooks` section, so the metadata survives #include and travels with
@@ -62,6 +63,11 @@ typedef unsigned int   word;
  * no relocation to read it). PPC mnemonics are short; 64 is ample. */
 #define CGECKO_INSTR_MAX 64
 
+/* Max length of a .notes string. Inline for the same reason as .instruction:
+ * cgecko reads the record's raw bytes, and a `const char *` would mean chasing
+ * a relocation into .rodata for something that is only ever a short blurb. */
+#define CGECKO_NOTES_MAX 256
+
 struct CGeckoHook {
     word   address;                        /* injection site; 0 = per-frame (C0) */
     word   state;                          /* MSSB_ALWAYS / MSSB_MENU / ...       */
@@ -70,7 +76,39 @@ struct CGeckoHook {
     void (*fn)(void);                      /* the code body                       */
     word   gate_addr;                      /* runtime on/off switch; 0 = always on */
     word   gate_value;                     /* the u32 that switch must hold to run  */
+    char   notes[CGECKO_NOTES_MAX];        /* what the code does, or ""            */
 };
+
+/* ── .notes: a code's description, as data ───────────────────────────────────
+ * The old way to describe a code is a `// *` comment, which cgecko scrapes out
+ * of the source and appends to the ini entry. That works for the ini and
+ * nowhere else: comments do not survive the preprocessor, so an #included mod's
+ * blurb is invisible to the code that included it.
+ *
+ *     CGECKO(CPUAlwaysSprints, .address = 0x80835AE0, .state = MSSB_GAME,
+ *            .notes = "CPU fielders always sprint.\n"
+ *                     "Does not affect human players.");
+ *
+ * `// *` comments still work and are still emitted; .notes is the option that
+ * also survives to RUNTIME. Embedded newlines become separate lines both in the
+ * ini and on screen.
+ *
+ * READING NOTES AT RUNTIME. In a DOL-baked build the whole pack is ONE
+ * translation unit, so cgecko_iso can collect every record's .notes into a
+ * table and hand it back through:
+ *
+ *     const char* CGecko_NotesForGate(word gate_addr);
+ *
+ * Keyed on the code's CGECKO_GATE_ADDR because that is what a mod-options UI
+ * already has: a menu row owns the toggle word, so it can ask for the notes of
+ * whatever mod that word switches. Returns 0 when no code with that gate
+ * declared .notes; a gate of 0 never matches, so ungated codes are skipped.
+ *
+ * ONLY IN DOL-BAKED BUILDS. The gecko path links each hook separately, so a mod
+ * included beside yours is not in your translation unit and its notes cannot be
+ * reached; cgecko emits them to the ini and stops there. Referencing this from
+ * a code built as a gecko code is a link error, which is the honest outcome. */
+const char* CGecko_NotesForGate(word gate_addr);
 
 /* -- CGECKO_GATE_ADDR / _VALUE: gate whole codes at INCLUDE time -----------
  * Every record picks up whatever these hold WHERE THE CGECKO()/ASM() LINE IS

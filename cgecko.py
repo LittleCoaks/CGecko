@@ -159,6 +159,20 @@ def parse_notes(source: str, is_asm: bool = False) -> list[str]:
     marker  = r"#" if is_asm else r"//"
     pattern = re.compile(rf"(?:{marker})\s*(\*[^\n]*)", re.MULTILINE)
     return [m.group(1).strip() for m in pattern.finditer(source)]
+def notes_to_ini_lines(text: str) -> list[str]:
+    """Turn one record's .notes string into ini description lines.
+
+    Dolphin treats any non-code line under a code as its description, and the
+    house style marks those with a leading '*' -- which is exactly what
+    parse_notes hands back, so both sources come out looking the same. Embedded
+    newlines split into separate lines; a line that already starts with '*' is
+    left as written."""
+    out = []
+    for line in text.replace("\r\n", "\n").split("\n"):
+        line = line.strip()
+        if line:
+            out.append(line if line.startswith("*") else "*" + line)
+    return out
 # ==============================================================================
 # INSTRUCTION ASSEMBLY
 # ==============================================================================
@@ -864,10 +878,12 @@ def split_codes(source: str, is_asm: bool = True) -> list[dict]:
 # ==============================================================================
 ASM_FLAG           = 0x1
 CGECKO_INSTR_MAX   = 64
+CGECKO_NOTES_MAX   = 256
 # struct CGeckoHook: u32 address, u32 state, u32 flags, char[64] instruction,
 #                   ptr fn, u32 gate_addr, u32 gate_value
-CGECKO_RECORD_SIZE = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4 + 4 + 4
-CGECKO_FN_OFFSET   = 4 + 4 + 4 + CGECKO_INSTR_MAX
+CGECKO_RECORD_SIZE  = 4 + 4 + 4 + CGECKO_INSTR_MAX + 4 + 4 + 4 + CGECKO_NOTES_MAX
+CGECKO_FN_OFFSET    = 4 + 4 + 4 + CGECKO_INSTR_MAX
+CGECKO_NOTES_OFFSET = CGECKO_FN_OFFSET + 4 + 4 + 4
 # Common.h MSSB_* state tags -> Project Rio scene-id conditional (addr, value).
 CGECKO_STATE_MAP = {
     1: (0x280E877C, 0x00000000),   # MSSB_BOOT
@@ -902,6 +918,9 @@ def parse_relocs(obj_path: str, section: str) -> dict[int, str]:
         if len(parts) >= 5:
             out[off] = parts[4]
     return out
+def _cstr(raw: bytes) -> str:
+    """Decode one inline, NUL-terminated char array out of a record."""
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
 def read_hook_records(obj_path: str) -> list[dict]:
     """Parse CGeckoHook records out of the compiled object's .cgecko_hooks section.
     Returns [] when the section is absent (no Common.h hooks declared)."""
@@ -936,9 +955,12 @@ def read_hook_records(obj_path: str) -> list[dict]:
         gate_value = struct.unpack_from(">I", data, base + CGECKO_FN_OFFSET + 8)[0]
         if gate_addr and not (0x80000000 <= gate_addr <= 0x81FFFFFF):
             die(f"Hook '{entry}': gate address {gate_addr:#x} outside GC RAM.")
+        nbase = base + CGECKO_NOTES_OFFSET
+        notes = _cstr(data[nbase:nbase + CGECKO_NOTES_MAX])
         hooks.append({"address": address, "state": state, "flags": flags,
                       "instruction": instr or None, "entry": entry,
-                      "gate_addr": gate_addr, "gate_value": gate_value})
+                      "gate_addr": gate_addr, "gate_value": gate_value,
+                      "notes": notes})
     return hooks
 def strip_section(obj_in: str, obj_out: str, section: str):
     """Copy an object with one section (and its relocations) removed, so build-
@@ -1063,9 +1085,14 @@ def build_c_hook(hook: dict, idx: int, obj_path: str, tmpdir: str, debug: bool) 
     print(f"[INFO]   {entry}()  ->  {'C3' if addr >= 0x81000000 else 'C2'} "
           f"@ {addr:#010x} ({len(payload)//8} lines)")
     return lines
-def generate_c_codes(c_path: str, tmpdir: str, debug: bool) -> list[str]:
+def generate_c_codes(c_path: str, tmpdir: str,
+                     debug: bool) -> tuple[list[str], list[str]]:
     """Compile a C file once, read its Common.h hook records, and build one gecko
-    code per hook. Per-hook state gates wrap each code independently."""
+    code per hook. Per-hook state gates wrap each code independently.
+
+    Returns (code lines, description lines) -- the second collected from every
+    record's .notes in declaration order and de-duplicated, since the hooks that
+    make up one mod usually repeat the same blurb."""
     obj = os.path.join(tmpdir, "unit.o")
     compile_c(c_path, obj, debug)
     hooks = read_hook_records(obj)
@@ -1081,6 +1108,13 @@ def generate_c_codes(c_path: str, tmpdir: str, debug: bool) -> list[str]:
     n_c2 = len(hooks) - n_c0
     print(f"[INFO] Hooks          : {len(hooks)}  ({n_c0} C0, {n_c2} C2)")
     all_lines: list[str] = []
+    note_lines: list[str] = []
+    for hook in hooks:
+        for line in notes_to_ini_lines(hook.get("notes") or ""):
+            if line not in note_lines:
+                note_lines.append(line)
+    if note_lines:
+        print(f"[INFO] Notes          : {len(note_lines)} line(s) from .notes")
     for i, hook in enumerate(hooks):
         print(f"[INFO] Hook {i + 1}/{len(hooks)} : {hook['entry']}()")
         lines = build_c_hook(hook, i, stripped, tmpdir, debug)
@@ -1099,7 +1133,7 @@ def generate_c_codes(c_path: str, tmpdir: str, debug: bool) -> list[str]:
             print(f"[INFO]   runtime gate: [{hook['gate_addr']:#010x}] == "
                   f"{hook['gate_value']:#x}")
         all_lines.extend(lines)
-    return all_lines
+    return all_lines, note_lines
 # ==============================================================================
 # ENTRY POINT
 # ==============================================================================
@@ -1233,7 +1267,11 @@ def main():
         else:
             # C: metadata comes from Common.h .cgecko_hooks records (per-hook state gates).
             cond_addr, cond_value = None, None
-            all_code_lines = generate_c_codes(c_path, tmpdir, debug)
+            all_code_lines, record_notes = generate_c_codes(c_path, tmpdir, debug)
+            # .notes and `// *` comments are both description sources: a file may
+            # use either or both, so append what the records carry after what the
+            # comments carried, minus anything already said.
+            notes = notes + [n for n in record_notes if n not in notes]
 
         if not all_code_lines:
             die("No gecko code lines were generated.")

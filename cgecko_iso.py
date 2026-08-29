@@ -142,6 +142,65 @@ DC_FLUSH = 0x8006E894
 IC_INVALIDATE = 0x8006E94C
 
 
+def c_string(text):
+    """A C string literal for `text`, with embedded newlines kept as \\n."""
+    out = []
+    for ch in text:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            continue
+        elif ch == "\t":
+            out.append("\\t")
+        elif " " <= ch <= "~":
+            out.append(ch)
+        else:
+            out.append("\\%03o" % ord(ch))          # keep the blob ASCII-safe
+    return '"' + "".join(out) + '"'
+
+
+def generate_notes_table(hooks):
+    """Emit CGecko_NotesForGate() over every record that declared .notes.
+
+    Common.h declares this; the definition can only exist here, because a
+    baked build is the one place the whole pack is a single translation unit
+    and one mod can therefore see another's blurb. The strings are re-emitted
+    rather than pointed at: the records live in .cgecko_hooks, which is
+    stripped before linking, so nothing may reference them at runtime.
+
+    Keyed on gate_addr because that is the key a mod-options UI already holds
+    -- a menu row owns the toggle word, so it can ask for the notes of the mod
+    that word switches. Codes with no gate are skipped: gate 0 is 'always on',
+    which is not a key, and every ungated code would otherwise collide on it."""
+    seen, rows = set(), []
+    for h in hooks:
+        note = (h.get("notes") or "").strip()
+        if not note or not h["gate_addr"] or h["gate_addr"] in seen:
+            continue
+        seen.add(h["gate_addr"])
+        rows.append((h["gate_addr"], note, h["entry"]))
+
+    out = ["/* .notes, addressable at runtime. See Common.h. */",
+           "const char* CGecko_NotesForGate(unsigned int gate_addr)",
+           "{"]
+    if not rows:
+        out += ["    (void)gate_addr;",
+                "    return 0;                    /* no code declared .notes */",
+                "}", ""]
+        return "\n".join(out), rows
+    out.append("    switch (gate_addr) {")
+    for gate, note, entry in rows:
+        out.append("    case 0x%08XU: return %s;   /* %s */" % (gate, c_string(note), entry))
+    out += ["    default: return 0;",
+            "    }",
+            "}", ""]
+    return "\n".join(out), rows
+
+
 def generate_source(pack_path, hooks):
     """Pass-2 scaffolding: the pack, plus shims for gated hooks and the frame."""
     inc = os.path.abspath(pack_path).replace("\\", "/")
@@ -180,6 +239,9 @@ def generate_source(pack_path, hooks):
             "}",
             "",
         ]
+    notes_src, note_rows = generate_notes_table(hooks)
+    out += ["", notes_src]
+
     shims = {}
     for h in hooks:
         if not h["address"]:
@@ -206,7 +268,7 @@ def generate_source(pack_path, hooks):
     if not n and not rel_hooks:
         out.append("    /* no per-frame hooks */")
     out.append("}")
-    return "\n".join(out) + "\n", shims
+    return "\n".join(out) + "\n", shims, note_rows
 
 
 def build(pack_path, load_addr, frame_site=None, frame_instr=None, debug=False):
@@ -233,7 +295,16 @@ def build(pack_path, load_addr, frame_site=None, frame_instr=None, debug=False):
                     % h["entry"])
 
     # ---- pass 2: generate scaffolding, compile the whole thing ------------
-    gen_src, shims = generate_source(pack_path, hooks)
+    gen_src, shims, note_rows = generate_source(pack_path, hooks)
+    if note_rows:
+        print("[INFO] .notes: %d gated code(s) reachable through CGecko_NotesForGate()"
+              % len(note_rows))
+    ungated = [h["entry"] for h in hooks if (h.get("notes") or "").strip()
+               and not h["gate_addr"]]
+    if ungated:
+        cg.warn("These codes declare .notes but have no CGECKO_GATE_ADDR, so "
+                "CGecko_NotesForGate() cannot key on them and their notes are "
+                "ini-only: " + ", ".join(sorted(set(ungated))))
     gen_path = os.path.join(tmpdir, "_iso_gen.c")
     with open(gen_path, "w", encoding="utf-8") as f:
         f.write(gen_src)
