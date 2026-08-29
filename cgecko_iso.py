@@ -150,12 +150,26 @@ def build(c_path, load_addr, debug=False):
         w += restore
         if h["instruction"]:
             w += struct.pack(">I", cg.assemble_instruction(h["instruction"], tmpdir))
-        w += struct.pack(">I", cg.BLR_INSTR)
+        if h["address"]:
+            # C2: branch back to site+4. The SITE gets `b wrapper`, NOT `bl` --
+            # a `bl` would overwrite LR with site+4, and a REPLACE hook
+            # (.instruction = "blr", e.g. Options Menu / Custom Menu Scene /
+            # Teams Exhibition 2) would then "return" into the middle of the
+            # function it is supposed to be replacing instead of to the
+            # function's caller. Using `b` leaves the game's LR untouched, so
+            # the displaced blr returns where the game expects and this trailing
+            # branch is simply unreachable. Augment hooks fall through to it
+            # normally. Same shape cgecko's own C2 emits.
+            back = wrapper + len(w)
+            w += struct.pack(">I", cg.B_BASE | ((h["address"] + 4 - back) & 0x03FFFFFC))
+        else:
+            w += struct.pack(">I", cg.BLR_INSTR)   # C0: called with bl, return
         blob += w
         manifest.append({
             "name": h["entry"],
             "kind": "c0" if not h["address"] else "c2",
             "site": h["address"],
+            "site_branch": "b" if h["address"] else None,
             "body": body,
             "wrapper": wrapper,
             "state": h["state"],
