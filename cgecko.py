@@ -555,12 +555,24 @@ def find_picdata_relocs(elf_path: str, picsize: int, debug: bool) -> list[tuple[
     out = subprocess.run([READELF, "-rW", elf_path],
                          capture_output=True, text=True).stdout
     relocs, unsupported = [], []
+    # Only the '.rela.picdata' block. readelf prints every section's relocs and
+    # an offset-only filter is not enough to tell them apart: with binutils
+    # 2.45+ (devkitPPC r48 / GCC 16) the linked ELF carries extra relocation
+    # blocks whose offsets are small, and a .text R_PPC_ADDR32 at +0x6 was being
+    # taken for a data pointer -- the "target" it reported was string bytes.
+    in_block = False
     for line in out.splitlines():
-        m = re.match(r"^([0-9A-Fa-f]{8})\s+[0-9A-Fa-f]{8}\s+(\S+)", line.strip())
+        s = line.strip()
+        if s.startswith("Relocation section"):
+            in_block = "'.rela.picdata'" in s
+            continue
+        if not in_block:
+            continue
+        m = re.match(r"^([0-9A-Fa-f]{8})\s+[0-9A-Fa-f]{8}\s+(\S+)", s)
         if not m:
             continue
         off, rtype = int(m.group(1), 16), m.group(2)
-        if off >= picsize:      # .text relocs live past picdata (VMA order)
+        if off >= picsize:      # never expected inside .rela.picdata; keep as a guard
             continue
         if rtype != "R_PPC_ADDR32":
             unsupported.append((off, rtype))
