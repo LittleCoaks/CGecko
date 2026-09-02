@@ -170,6 +170,35 @@ static inline const char* CGecko_NotesForOption(word option_addr)
 #define CGECKO_OPTION_ADDR CGECKO_GATE_ADDR
 #endif
 
+/* -- CGECKO_ACTIVE: "should this code be doing its job right now?" ----------
+ * The gate above switches a code off by never RUNNING it, which is right for
+ * a code that only ever applies something. A code that edits game code or
+ * game state has to keep running while it is off in order to put the
+ * original back, so it cannot be gated away. It self-gates on this instead:
+ *
+ *     void DuplicateCharacters()
+ *     {
+ *         bool on = CGECKO_ACTIVE;
+ *         ...apply when on, restore when off...
+ *     }
+ *
+ * On its own CGECKO_ACTIVE is the constant 1: the compiler folds the restore
+ * path away and the built gecko code carries no notion of a toggle at all.
+ * A pack that wants to switch the mod at runtime defines it to an expression
+ * BEFORE including the file, and the mod never learns where that lives:
+ *
+ *     #undef  CGECKO_ACTIVE
+ *     #define CGECKO_ACTIVE (VAR_ADDRESS(u32, 0x802EB01C) != 0)
+ *     #include "Gecko Codes/Menu/Duplicate Characters.c"
+ *     #undef  CGECKO_ACTIVE
+ *     #define CGECKO_ACTIVE 1
+ *
+ * Any expression is allowed, not only a word compare -- "the music slot is set
+ * to this track" is as valid a condition as an on/off flag. */
+#ifndef CGECKO_ACTIVE
+#define CGECKO_ACTIVE 1
+#endif
+
 #define _CGECKO_RECORD(fn_, ...)                                                   \
     void fn_(void);                                                                \
     static const struct CGeckoHook __attribute__((section(".cgecko_hooks"), used))  \
