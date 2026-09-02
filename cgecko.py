@@ -29,6 +29,9 @@ OBJCOPY = tool("powerpc-eabi-objcopy")
 OBJDUMP = tool("powerpc-eabi-objdump")
 READELF = tool("powerpc-eabi-readelf")
 GCC_FLAGS = [
+    "-std=gnu11",    # pin the C standard: GCC 15+ defaults to C23, where `bool` is a
+                     # keyword (the game headers typedef it) and `()` in a cast means
+                     # (void), so FUNCTION_ADDRESS-style calls stop compiling
     "-DGEKKO",
     "-mogc",
     "-mcpu=750",
